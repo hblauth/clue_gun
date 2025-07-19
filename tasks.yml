@@ -1,0 +1,177 @@
+mvp_plan:
+  - stage: scaffolding
+    tasks:
+      - name: create_monorepo_structure
+        description: Create top-level file and folder layout with placeholders.
+        start: "Empty Git repository"
+        end: "Directory structure scaffolded with README"
+
+      - name: setup_dev_containers
+        description: Configure Docker-based dev environment for Python and Golang.
+        start: "Local-only dev environment"
+        end: "Dev containers and docker-compose.yaml present"
+
+      - name: configure_linting_and_formatting
+        description: Add and test Python and Go linters and formatters.
+        start: "No code style enforcement"
+        end: "`ruff`, `black`, `golangci-lint` functional"
+
+      - name: setup_pre_commit_hooks
+        description: Enable pre-commit Git hooks for lint, format, and test.
+        start: "No Git hooks"
+        end: "Hooks run automatically on commit"
+
+  - stage: times_scraper
+    tasks:
+      - name: setup_basic_scraper
+        description: Fetch raw HTML of a known Times crossword.
+        start: "Empty Go module"
+        end: "CLI fetches HTML content"
+
+      - name: parse_crossword_from_html
+        description: Extract clue data and answers into Go structs.
+        start: "Raw HTML content"
+        end: "Structured crossword data parsed"
+
+      - name: save_parsed_crossword_json
+        description: Save parsed crossword as local JSON file.
+        start: "Structured crossword data"
+        end: "JSON file saved per puzzle"
+
+      - name: test_html_parser
+        description: Write unit test for HTML-to-struct parsing.
+        start: "No test coverage"
+        end: "Test passes on sample HTML"
+
+  - stage: snowflake_integration
+    tasks:
+      - name: create_crossword_table
+        description: Create `crosswords_raw` table in Snowflake.
+        start: "No schema"
+        end: "DDL executed, table exists"
+
+      - name: setup_snowflake_client
+        description: Add reusable Snowflake client in Python.
+        start: "No database access code"
+        end: "`shared/clients/snowflake.py` can connect"
+
+      - name: load_json_to_snowflake
+        description: Insert local crossword JSONs into Snowflake.
+        start: "JSONs only exist locally"
+        end: "Rows inserted into `crosswords_raw`"
+
+      - name: test_data_loaded
+        description: Verify inserted crossword data matches schema.
+        start: "Unverified DB contents"
+        end: "Assertions on test record pass"
+
+  - stage: clue_indexer
+    tasks:
+      - name: extract_words_from_crosswords
+        description: Extract all individual words from stored answers.
+        start: "Raw crossword rows"
+        end: "Flat list of words"
+
+      - name: count_word_frequency
+        description: Generate frequency counts from list of words.
+        start: "Unaggregated words"
+        end: "Frequency dictionary created"
+
+      - name: store_word_stats
+        description: Insert word frequency into `dictionary_stats` table.
+        start: "Frequency in memory"
+        end: "Rows persisted to Snowflake"
+
+      - name: test_word_counter
+        description: Verify output of frequency counter on known input.
+        start: "No tests"
+        end: "Test passes on fixture set"
+
+  - stage: image_processor
+    tasks:
+      - name: load_and_show_image
+        description: Load and visualize a static crossword photo.
+        start: "Static image file"
+        end: "Image displayed with OpenCV"
+
+      - name: detect_highlighted_squares
+        description: Use OpenCV to find highlighted clue squares.
+        start: "Loaded image"
+        end: "Boxes drawn around highlights"
+
+      - name: infer_clue_number
+        description: Match highlight to numbered clue position.
+        start: "Grid coordinates of highlights"
+        end: "Numeric clue ID identified"
+
+      - name: perform_ocr_on_clue
+        description: Run OCR to extract clue text from image region.
+        start: "Cropped image region"
+        end: "Extracted clue text string"
+
+      - name: save_extracted_clue
+        description: Save clue text + metadata to local JSON.
+        start: "OCR results"
+        end: "JSON with clue metadata exists"
+
+      - name: test_ocr_output
+        description: Compare OCR results on known image to expected clue.
+        start: "OCR unverified"
+        end: "Test passes on sample clue image"
+
+  - stage: social_bot
+    tasks:
+      - name: generate_caption
+        description: Turn a clue into a templated caption string.
+        start: "Clue text"
+        end: "Formatted social caption"
+
+      - name: select_visual_asset
+        description: Pick background image or video asset for clue.
+        start: "Clue context"
+        end: "Asset path selected"
+
+      - name: render_video_clip
+        description: Combine clue + asset into short video.
+        start: "Text + asset"
+        end: "MP4 file rendered"
+
+      - name: save_video_to_queue
+        description: Save rendered video and metadata for posting.
+        start: "Video created"
+        end: "File saved in `/media/queue/`"
+
+      - name: log_post_metadata
+        description: Insert metadata row into `social_posts` table.
+        start: "Untracked post"
+        end: "Row added to Snowflake"
+
+  - stage: frontend
+    tasks:
+      - name: scaffold_frontend_app
+        description: Set up minimal frontend app with framework of choice.
+        start: "Empty frontend directory"
+        end: "Dev server runs locally"
+
+      - name: fetch_clue_from_api
+        description: Display clue + media on frontend.
+        start: "Static frontend"
+        end: "Fetched clue + video rendered"
+
+      - name: deploy_frontend
+        description: Deploy frontend app to Vercel or GCP.
+        start: "Local-only"
+        end: "Live URL available"
+
+  - stage: orchestration
+    optional: true
+    tasks:
+      - name: create_airflow_dag
+        description: Build DAG to scrape, analyze, and generate post.
+        start: "Manual steps"
+        end: "Orchestrated pipeline runs"
+
+      - name: trigger_bot_daily
+        description: Schedule social bot to run from DAG.
+        start: "Manual posting"
+        end: "New post queued daily"
