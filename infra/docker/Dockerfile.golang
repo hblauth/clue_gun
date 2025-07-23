@@ -1,0 +1,20 @@
+FROM golang:1.21
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    git \
+    bash \
+    curl \
+    python3-pip \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install golangci-lint
+RUN curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/master/install.sh | sh -s -- -b /usr/local/bin v1.54.2
+
+# Install pre-commit
+RUN pip3 install --break-system-packages pre-commit
+
+# Create non-root user
+RUN useradd -ms /bin/bash devuser
+WORKDIR /workspace
+USER devuser
+CMD ["bash"] 

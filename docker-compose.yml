@@ -1,5 +1,3 @@
-version: '3.8'
-
 services:
   redis:
     image: redis:7-alpine
@@ -7,6 +5,24 @@ services:
       - "6379:6379"
     volumes:
       - redis_data:/data
+
+  python-dev:
+    build:
+      context: .
+      dockerfile: infra/docker/Dockerfile.python
+    volumes:
+      - ./:/workspace
+    working_dir: /workspace
+    tty: true
+
+  go-dev:
+    build:
+      context: .
+      dockerfile: infra/docker/Dockerfile.golang
+    volumes:
+      - ./:/workspace
+    working_dir: /workspace
+    tty: true
 
   # Development services will be added as we build them
   # api:

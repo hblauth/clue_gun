@@ -1,1 +1,1 @@
-# Shared constants for the crossword blog project 
+# Shared constants for the crossword blog project

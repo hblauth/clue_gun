@@ -1,1 +1,1 @@
-# FastAPI service for crossword blog API 
+# FastAPI service for crossword blog API

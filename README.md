@@ -19,6 +19,7 @@ This project consists of multiple services:
 - Go 1.21+
 - Docker & Docker Compose
 - Snowflake account
+- pre-commit (for Git hooks)
 
 ### Quick Start
 ```bash
@@ -27,6 +28,9 @@ docker-compose up -d
 
 # Install dependencies
 pip install -r requirements.txt
+
+# Install pre-commit hooks
+pre-commit install
 ```
 
 ## Project Structure
