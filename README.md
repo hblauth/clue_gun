@@ -18,7 +18,6 @@ This project consists of multiple services:
 - Python 3.11+
 - Go 1.21+
 - Docker & Docker Compose
-- Snowflake account
 - pre-commit (for Git hooks)
 
 ### Quick Start
@@ -45,6 +44,57 @@ crossword_blog/
 ├── shared/                 # Shared utilities and clients
 └── tests/                  # Test suites
 ```
+
+## TODO
+
+### Times Scraper
+- [ ] Parse crossword HTML into Go structs (clues + answers) ← in progress
+- [ ] Save parsed crosswords as local JSON files
+- [ ] Write unit tests for HTML parser
+
+### PostgreSQL Integration
+- [ ] Create `crosswords_raw` table (DDL)
+- [ ] Build reusable PostgreSQL client (`shared/clients/postgres.py`)
+- [ ] Load local JSON files into PostgreSQL
+- [ ] Verify inserted data matches schema
+
+### Clue Indexer
+- [ ] Extract unique words from clues and answers (MVP)
+- [ ] Count word frequencies
+- [ ] Store word stats in `dictionary_stats` table
+- [ ] Write tests for frequency counter
+- [ ] % of Collins words used in crosswords
+- [ ] Classify words by function (noun, verb, indicator, etc.)
+- [ ] Add phrases (multi-word answers and clue fragments)
+
+### Image Processor
+- [ ] Load and display crossword photo with OpenCV
+- [ ] Detect highlighted squares
+- [ ] Map highlights to clue numbers
+- [ ] OCR clue text from image regions
+- [ ] Save OCR results as JSON
+- [ ] Write tests for OCR output
+
+### Social Bot
+- [ ] Generate templated captions from clues
+- [ ] Select visual asset per clue
+- [ ] Render short video clip (text + asset → MP4)
+- [ ] Queue video + metadata for posting
+- [ ] Log post metadata to PostgreSQL
+
+### Frontend
+- [ ] Scaffold frontend app (Next.js or SvelteKit)
+- [ ] Display clue + media fetched from API
+- [ ] Deploy to Vercel or GCP
+
+### Orchestration (optional)
+- [ ] Create Airflow DAG for daily scrape → analyse → post pipeline
+- [ ] Schedule social bot to run from DAG
+
+### Backlog
+- [ ] Look at old Times for the Times website for more puzzles
+- [ ] Scrape the Times Crossword Club website for clues and perhaps answers
+- [ ] Move to cloud app
 
 ## Contributing
 
