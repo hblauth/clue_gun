@@ -50,20 +50,20 @@ def upsert_crossword(cur, puzzle: dict) -> None:
     cur.execute(
         """
         INSERT INTO crosswords_raw
-            (puzzle_number, date, blogger, url, across, down)
+            (puzzle_number, puzzle_date, blogger, url, across, down)
         VALUES
-            (%(puzzle_number)s, %(date)s, %(blogger)s, %(url)s,
+            (%(puzzle_number)s, %(puzzle_date)s, %(blogger)s, %(url)s,
              %(across)s::jsonb, %(down)s::jsonb)
         ON CONFLICT (puzzle_number) DO UPDATE SET
-            date     = EXCLUDED.date,
-            blogger  = EXCLUDED.blogger,
-            url      = EXCLUDED.url,
-            across   = EXCLUDED.across,
-            down     = EXCLUDED.down
+            puzzle_date = EXCLUDED.puzzle_date,
+            blogger     = EXCLUDED.blogger,
+            url         = EXCLUDED.url,
+            across      = EXCLUDED.across,
+            down        = EXCLUDED.down
         """,
         {
             "puzzle_number": puzzle["puzzle_number"],
-            "date": puzzle.get("date") or None,
+            "puzzle_date": puzzle.get("date") or None,
             "blogger": puzzle.get("blogger") or None,
             "url": puzzle["url"],
             "across": psycopg2.extras.Json(puzzle.get("across", [])),
