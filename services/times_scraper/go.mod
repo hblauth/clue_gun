@@ -1,4 +1,4 @@
-module github.com/xword_blog/times_scraper
+module github.com/hblauth/clue_gun/services/times_scraper
 
 go 1.25.0
 

@@ -47,7 +47,7 @@ func main() {
 			return runBatch(args[0], outDir, time.Duration(delayMs)*time.Millisecond)
 		},
 	}
-	batchCmd.Flags().StringVarP(&outDir, "out", "o", "data/puzzles", "Output directory for JSON files")
+	batchCmd.Flags().StringVarP(&outDir, "out", "o", "../../data/puzzles", "Output directory for JSON files")
 	batchCmd.Flags().IntVarP(&delayMs, "delay", "d", 2000, "Delay between requests in milliseconds")
 
 	rootCmd.AddCommand(scrapeCmd, batchCmd)

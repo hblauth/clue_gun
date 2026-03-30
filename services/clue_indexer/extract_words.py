@@ -13,8 +13,8 @@ import re
 import sys
 from pathlib import Path
 
-PUZZLES_DIR = Path(__file__).parent.parent / "times_scraper" / "data" / "puzzles"
-OUT_DIR = Path(__file__).parent / "data"
+PUZZLES_DIR = Path(__file__).parent.parent.parent / "data" / "puzzles"
+OUT_DIR = Path(__file__).parent.parent.parent / "data" / "words"
 
 
 def tokenise(text: str) -> list[str]:

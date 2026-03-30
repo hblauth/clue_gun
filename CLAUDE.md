@@ -21,10 +21,13 @@ pytest           # Run tests (tests/ directory)
 ```bash
 make lint-go     # golangci-lint
 make format-go   # gofmt
+make build-go    # build times_scraper binary
 
 cd services/times_scraper && go build ./...
 cd services/times_scraper && go test ./...
 ```
+
+> go.mod lives in `services/times_scraper/`, not the repo root. Module: `github.com/hblauth/clue_gun/services/times_scraper`
 
 ### Docker (local dev)
 ```bash
@@ -50,9 +53,18 @@ pre-commit install   # Install hooks (Black, Ruff, golangci-lint, gofmt)
 - **Redis**: social media posting queue, word frequency cache
 - **GCS/S3**: ML outputs (JSON/Parquet), media assets
 
+## Data Layout
+
+Generated data lives under `data/` (gitignored):
+- `data/puzzles/` — scraped crossword JSONs (produced by times_scraper batch)
+- `data/words/` — word lists (produced by clue_indexer extract_words.py)
+- `data/postgres/` — PostgreSQL data files (bind-mounted by docker-compose)
+
+URL input lists stay in `services/times_scraper/data/` (inputs, not outputs).
+
 ## Project Status
 
-Most services are scaffolded but unimplemented. The `services/times_scraper` Go CLI has basic HTML fetching via colly/cobra. `apps/api` is a Python/FastAPI stub. See `tasks.yml` for the full staged roadmap and `architecture.md` for deeper design documentation.
+`services/times_scraper` is fully implemented (Go CLI, 3 HTML format parsers, 1,400+ puzzles scraped). `services/clue_indexer` has a working word extractor. `apps/api` and all other services are stubs. `db/migrations/` has the initial PostgreSQL schema. See `tasks.yml` for the roadmap.
 
 ## Languages & Tools
 

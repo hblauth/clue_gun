@@ -55,4 +55,9 @@ Thumbs.db
 *.log
 media/
 data/
-temp/ 
+temp/
+
+# Compiled binaries (unextensioned Go executables)
+/times_scraper
+services/times_scraper/times_scraper
+services/times_scraper/times_scraper_fixed
