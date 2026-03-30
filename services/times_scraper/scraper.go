@@ -225,19 +225,27 @@ func parseProse(doc *goquery.Document) (across, down []Clue) {
 	return
 }
 
-func Scrape(url string) (*Crossword, error) {
-	xwd := &Crossword{URL: url}
+// ScrapeBytes parses a crossword from pre-fetched HTML bytes.
+// Use this when reading from a local HTML cache.
+func ScrapeBytes(url string, body []byte) (*Crossword, error) {
+	doc, err := goquery.NewDocumentFromReader(bytes.NewReader(body))
+	if err != nil {
+		return nil, fmt.Errorf("parse %s: %w", url, err)
+	}
+	return parseDoc(url, doc), nil
+}
 
+func Scrape(url string) (*Crossword, error) {
 	// Saturday posts are blocked by Mod_Security on the frontend; use WP REST API instead.
 	if isSaturdayURL(url) {
 		html, title, date, err := fetchSaturdayHTML(url)
 		if err != nil {
 			return nil, err
 		}
+		xwd := &Crossword{URL: url, Date: date}
 		if m := puzzleNumRe.FindStringSubmatch(title); m != nil {
 			xwd.PuzzleNumber, _ = strconv.Atoi(m[1])
 		}
-		xwd.Date = date
 		doc, err := goquery.NewDocumentFromReader(bytes.NewReader(html))
 		if err != nil {
 			return nil, fmt.Errorf("parse prose %s: %w", url, err)
@@ -250,20 +258,49 @@ func Scrape(url string) (*Crossword, error) {
 	if err != nil {
 		return nil, err
 	}
+	return ScrapeBytes(url, body)
+}
 
-	doc, err := goquery.NewDocumentFromReader(bytes.NewReader(body))
-	if err != nil {
-		return nil, fmt.Errorf("parse %s: %w", url, err)
+// FetchHTML downloads the raw HTML for a URL. For Saturday posts this reconstructs
+// a minimal HTML document from the WP REST API content fragment so the cache
+// format is consistent (always a complete HTML doc).
+func FetchHTML(url string) ([]byte, error) {
+	if isSaturdayURL(url) {
+		content, title, date, err := fetchSaturdayHTML(url)
+		if err != nil {
+			return nil, err
+		}
+		// Wrap fragment in a minimal HTML shell so parseDoc works on cached files.
+		wrapped := fmt.Sprintf(
+			`<html><head><title>%s</title><meta name="date" content="%s"></head><body><article><h1 class="entry-title">%s</h1>%s</article></body></html>`,
+			title, date, title, string(content),
+		)
+		return []byte(wrapped), nil
 	}
+	return fetch(url)
+}
+
+func parseDoc(url string, doc *goquery.Document) *Crossword {
+	xwd := &Crossword{URL: url}
 
 	title := strings.TrimSpace(doc.Find("h1.entry-title").First().Text())
 	if m := puzzleNumRe.FindStringSubmatch(title); m != nil {
 		xwd.PuzzleNumber, _ = strconv.Atoi(m[1])
 	}
 	xwd.Date = strings.TrimSpace(doc.Find("time.entry-date.published").First().Text())
+	if xwd.Date == "" {
+		// Saturday cached pages store date in a meta tag.
+		xwd.Date = strings.TrimSpace(doc.Find(`meta[name="date"]`).AttrOr("content", ""))
+	}
 	xwd.Blogger = strings.TrimSpace(doc.Find(".byline a.url").First().Text())
 
-	// New format: <table class="clues"> with <thead> direction and td.num / td.clue / td.ans
+	// Saturday prose format.
+	if isSaturdayURL(url) {
+		xwd.Across, xwd.Down = parseProse(doc)
+		return xwd
+	}
+
+	// New format: <table class="clues">
 	doc.Find("table.clues").Each(func(_ int, table *goquery.Selection) {
 		direction := strings.ToLower(strings.TrimSpace(table.Find("thead th").First().Text()))
 		clues := parseNewFormatClues(table.Find("tbody tr"))
@@ -275,19 +312,18 @@ func Scrape(url string) (*Crossword, error) {
 		}
 	})
 
-	// Old format: <table cellspacing="3"> — may be one table per direction or a single
-	// table with both, separated by plain-text "Across"/"Down" header rows.
+	// Old format: <table cellspacing="3"> or <table cellspacing="5">
 	if len(xwd.Across) == 0 && len(xwd.Down) == 0 {
-		doc.Find("table[cellspacing='3']").Each(func(_ int, table *goquery.Selection) {
-			ac, dn := parseOldFormatTable(table.Find("tbody tr"))
-			if xwd.Across == nil {
+		doc.Find("table[cellspacing='3'],table[cellspacing='5']").Each(func(_ int, table *goquery.Selection) {
+			ac, dn := parseOldFormatTable(table.Find("tr"))
+			if len(xwd.Across) == 0 {
 				xwd.Across = ac
 			}
-			if xwd.Down == nil {
+			if len(xwd.Down) == 0 {
 				xwd.Down = dn
 			}
 		})
 	}
 
-	return xwd, nil
+	return xwd
 }

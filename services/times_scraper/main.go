@@ -38,19 +38,34 @@ func main() {
 	// Batch mode: read URLs from file, save JSON per puzzle
 	var outDir string
 	var delayMs int
+	var htmlCacheDir string
 
 	batchCmd := &cobra.Command{
 		Use:   "batch <urls-file>",
 		Short: "Scrape all URLs in a file, saving one JSON per puzzle",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return runBatch(args[0], outDir, time.Duration(delayMs)*time.Millisecond)
+			return runBatch(args[0], outDir, htmlCacheDir, time.Duration(delayMs)*time.Millisecond)
 		},
 	}
 	batchCmd.Flags().StringVarP(&outDir, "out", "o", "../../data/puzzles", "Output directory for JSON files")
 	batchCmd.Flags().IntVarP(&delayMs, "delay", "d", 2000, "Delay between requests in milliseconds")
+	batchCmd.Flags().StringVar(&htmlCacheDir, "html-cache", "", "Directory of cached HTML files; fetch from network if not found")
 
-	rootCmd.AddCommand(scrapeCmd, batchCmd)
+	// fetch-html: download raw HTML for each URL without parsing
+	var fetchDelay int
+
+	fetchHTMLCmd := &cobra.Command{
+		Use:   "fetch-html <urls-file> <cache-dir>",
+		Short: "Download raw HTML for each URL and save to cache-dir/{slug}.html",
+		Args:  cobra.ExactArgs(2),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return runFetchHTML(args[0], args[1], time.Duration(fetchDelay)*time.Millisecond)
+		},
+	}
+	fetchHTMLCmd.Flags().IntVarP(&fetchDelay, "delay", "d", 2000, "Delay between requests in milliseconds")
+
+	rootCmd.AddCommand(scrapeCmd, batchCmd, fetchHTMLCmd)
 
 	if err := rootCmd.Execute(); err != nil {
 		fmt.Fprintln(os.Stderr, err)
@@ -58,23 +73,14 @@ func main() {
 	}
 }
 
-func runBatch(urlsFile, outDir string, delay time.Duration) error {
+func runBatch(urlsFile, outDir, htmlCacheDir string, delay time.Duration) error {
 	if err := os.MkdirAll(outDir, 0755); err != nil {
 		return fmt.Errorf("create output dir: %w", err)
 	}
 
-	f, err := os.Open(urlsFile)
+	urls, err := readLines(urlsFile)
 	if err != nil {
-		return fmt.Errorf("open %s: %w", urlsFile, err)
-	}
-	defer f.Close()
-
-	var urls []string
-	scanner := bufio.NewScanner(f)
-	for scanner.Scan() {
-		if u := strings.TrimSpace(scanner.Text()); u != "" {
-			urls = append(urls, u)
-		}
+		return err
 	}
 
 	total := len(urls)
@@ -84,7 +90,6 @@ func runBatch(urlsFile, outDir string, delay time.Duration) error {
 		puzzleNum := extractPuzzleNum(url)
 		outPath := filepath.Join(outDir, puzzleNum+".json")
 
-		// Skip already scraped
 		if _, err := os.Stat(outPath); err == nil {
 			skipped++
 			continue
@@ -92,11 +97,27 @@ func runBatch(urlsFile, outDir string, delay time.Duration) error {
 
 		fmt.Fprintf(os.Stderr, "[%d/%d] %s ... ", i+1, total, url)
 
-		xwd, err := Scrape(url)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "FAILED: %v\n", err)
-			failed++
-			continue
+		var xwd *Crossword
+		if htmlCacheDir != "" {
+			cachePath := filepath.Join(htmlCacheDir, urlSlug(url)+".html")
+			if body, err := os.ReadFile(cachePath); err == nil {
+				xwd, err = ScrapeBytes(url, body)
+				if err != nil {
+					fmt.Fprintf(os.Stderr, "FAILED parse cached: %v\n", err)
+					failed++
+					continue
+				}
+			}
+		}
+
+		if xwd == nil {
+			xwd, err = Scrape(url)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "FAILED: %v\n", err)
+				failed++
+				continue
+			}
+			time.Sleep(delay)
 		}
 
 		if xwd.PuzzleNumber == 0 || (len(xwd.Across) == 0 && len(xwd.Down) == 0) {
@@ -121,13 +142,74 @@ func runBatch(urlsFile, outDir string, delay time.Duration) error {
 		done++
 		fmt.Fprintf(os.Stderr, "OK (#%d, %dac %ddn)\n",
 			xwd.PuzzleNumber, len(xwd.Across), len(xwd.Down))
-
-		time.Sleep(delay)
 	}
 
 	fmt.Fprintf(os.Stderr, "\nDone. scraped=%d  skipped=%d  failed=%d  total=%d\n",
 		done, skipped, failed, total)
 	return nil
+}
+
+func runFetchHTML(urlsFile, cacheDir string, delay time.Duration) error {
+	if err := os.MkdirAll(cacheDir, 0755); err != nil {
+		return fmt.Errorf("create cache dir: %w", err)
+	}
+
+	urls, err := readLines(urlsFile)
+	if err != nil {
+		return err
+	}
+
+	total := len(urls)
+	skipped, done, failed := 0, 0, 0
+
+	for i, url := range urls {
+		cachePath := filepath.Join(cacheDir, urlSlug(url)+".html")
+
+		if _, err := os.Stat(cachePath); err == nil {
+			skipped++
+			continue
+		}
+
+		fmt.Fprintf(os.Stderr, "[%d/%d] %s ... ", i+1, total, url)
+
+		body, err := FetchHTML(url)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "FAILED: %v\n", err)
+			failed++
+			continue
+		}
+
+		if err := os.WriteFile(cachePath, body, 0644); err != nil {
+			fmt.Fprintf(os.Stderr, "FAILED write: %v\n", err)
+			failed++
+			continue
+		}
+
+		done++
+		fmt.Fprintf(os.Stderr, "OK (%d bytes)\n", len(body))
+		time.Sleep(delay)
+	}
+
+	fmt.Fprintf(os.Stderr, "\nDone. fetched=%d  skipped=%d  failed=%d  total=%d\n",
+		done, skipped, failed, total)
+	return nil
+}
+
+func readLines(path string) ([]string, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, fmt.Errorf("open %s: %w", path, err)
+	}
+	defer f.Close()
+
+	var lines []string
+	scanner := bufio.NewScanner(f)
+	for scanner.Scan() {
+		if u := strings.TrimSpace(scanner.Text()); u != "" {
+			lines = append(lines, u)
+		}
+	}
+	return lines, scanner.Err()
 }
 
 func extractPuzzleNum(url string) string {
