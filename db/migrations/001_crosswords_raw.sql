@@ -9,6 +9,7 @@ CREATE TABLE IF NOT EXISTS crosswords_raw (
     url             TEXT NOT NULL,
     across          JSONB NOT NULL DEFAULT '[]',
     down            JSONB NOT NULL DEFAULT '[]',
+    scraped_at      TIMESTAMPTZ,
     loaded_at       TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
