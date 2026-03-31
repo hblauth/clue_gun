@@ -31,7 +31,9 @@ type Crossword struct {
 
 var (
 	// Matches: "Times 29503", "Times Cryptic 29496", "Times Cryptic No. 27282", "Times 23,034"
-	puzzleNumRe   = regexp.MustCompile(`(?i)Times\s+(?:Cryptic\s+)?(?:No\.?\s+)?(\d{1,2},\d{3}|\d{4,5})`)
+	// Also handles: "Times – 23945" (en dash separator), "Times 26;971" (semicolon typo),
+	// and 6-digit special numbers like "Times 120430".
+	puzzleNumRe = regexp.MustCompile(`(?i)Times\s+(?:Cryptic\s+)?(?:No\.?\s+)?[–—\s]*(\d{1,2}[,;]\d{3}|\d{4,6})`)
 	letterCountRe = regexp.MustCompile(`\([\d,]+\)\s*$`)
 	clueNumRe     = regexp.MustCompile(`^(\d+)\s+`)
 
@@ -53,7 +55,24 @@ func urlSlug(url string) string {
 	return url[strings.LastIndex(url, "/")+1:]
 }
 
+// puzzleNumFromURL extracts a 4–6 digit puzzle number from the URL slug as a fallback
+// when the post title doesn't match the standard "Times NNNNN" pattern.
+func puzzleNumFromURL(url string) int {
+	slug := urlSlug(url)
+	for _, part := range strings.Split(slug, "-") {
+		if len(part) >= 4 && len(part) <= 6 {
+			if n, err := strconv.Atoi(part); err == nil {
+				return n
+			}
+		}
+	}
+	return 0
+}
+
 func isSaturdayURL(url string) bool {
+	// Only older-style slugs like "saturday-30-may-..." use the WP REST API prose format.
+	// Newer slugs like "times-cryptic-no-28008-saturday-19-june-..." use the table format
+	// and are fetched as regular pages.
 	return strings.HasPrefix(urlSlug(url), "saturday-")
 }
 
@@ -434,7 +453,11 @@ func Scrape(url string) (*Crossword, error) {
 		}
 		xwd := &Crossword{URL: url, Date: date}
 		if m := puzzleNumRe.FindStringSubmatch(title); m != nil {
-			xwd.PuzzleNumber, _ = strconv.Atoi(strings.ReplaceAll(m[1], ",", ""))
+			clean := strings.NewReplacer(",", "", ";", "").Replace(m[1])
+			xwd.PuzzleNumber, _ = strconv.Atoi(clean)
+		}
+		if xwd.PuzzleNumber == 0 {
+			xwd.PuzzleNumber = puzzleNumFromURL(url)
 		}
 		doc, err := goquery.NewDocumentFromReader(bytes.NewReader(html))
 		if err != nil {
@@ -475,7 +498,13 @@ func parseDoc(url string, doc *goquery.Document) *Crossword {
 
 	title := strings.TrimSpace(doc.Find("h1.entry-title").First().Text())
 	if m := puzzleNumRe.FindStringSubmatch(title); m != nil {
-		xwd.PuzzleNumber, _ = strconv.Atoi(strings.ReplaceAll(m[1], ",", ""))
+		// Strip both comma and semicolon thousands separators (e.g. "26;971" → 26971)
+		clean := strings.NewReplacer(",", "", ";", "").Replace(m[1])
+		xwd.PuzzleNumber, _ = strconv.Atoi(clean)
+	}
+	// Fallback: extract from URL slug when title regex fails (e.g. "Times – 23945")
+	if xwd.PuzzleNumber == 0 {
+		xwd.PuzzleNumber = puzzleNumFromURL(url)
 	}
 	xwd.Date = strings.TrimSpace(doc.Find("time.entry-date.published").First().Text())
 	if xwd.Date == "" {
@@ -502,23 +531,50 @@ func parseDoc(url string, doc *goquery.Document) *Crossword {
 		}
 	})
 
-	// Old format: <table cellspacing="3"> or <table cellspacing="5">
+	// Old format: <table cellspacing="N"> (N = 3, 4, or 5)
 	if len(xwd.Across) == 0 && len(xwd.Down) == 0 {
-		doc.Find("table[cellspacing='3'],table[cellspacing='5']").Each(func(_ int, table *goquery.Selection) {
+		doc.Find("table[cellspacing='3'],table[cellspacing='4'],table[cellspacing='5']").Each(func(_ int, table *goquery.Selection) {
+			// Skip tables nested inside another table (answer cells sometimes contain
+			// formatting sub-tables). ParentsFiltered checks ancestors only, not self.
+			if table.ParentsFiltered("table").Length() > 0 {
+				return
+			}
 			ac, dn := parseOldFormatTable(table.Find("tr"))
-			// If both directions came back empty for down (no direction headers in table),
-			// assign across clues to whichever direction is still missing.
 			if len(xwd.Across) == 0 {
 				xwd.Across = ac
 				xwd.Down = dn
 			} else if len(xwd.Down) == 0 {
-				// Second table: treat its across result as down if it has no header.
 				if len(dn) == 0 && len(ac) > 0 {
 					xwd.Down = ac
 				} else {
 					xwd.Down = dn
 				}
 			}
+		})
+	}
+
+	// lj-spoiler format: Saturday posts (2021+) put clues inside a spoiler widget.
+	// Go's HTML parser hoists tables out of inline <span> elements, so the clue tables
+	// end up as siblings of the <p> that contains the .lj-spoiler widget.
+	// We locate them via .lj-spoiler's parent's following siblings.
+	if len(xwd.Across) == 0 && len(xwd.Down) == 0 {
+		doc.Find(".lj-spoiler").Each(func(_ int, spoiler *goquery.Selection) {
+			spoiler.Parent().NextAll().Filter("table").Each(func(_ int, table *goquery.Selection) {
+				if table.ParentsFiltered("table").Length() > 0 {
+					return
+				}
+				ac, dn := parseOldFormatTable(table.Find("tr"))
+				if len(xwd.Across) == 0 {
+					xwd.Across = ac
+					xwd.Down = dn
+				} else if len(xwd.Down) == 0 {
+					if len(dn) == 0 && len(ac) > 0 {
+						xwd.Down = ac
+					} else {
+						xwd.Down = dn
+					}
+				}
+			})
 		})
 	}
 

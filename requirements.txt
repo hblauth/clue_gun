@@ -16,6 +16,7 @@ pillow==10.1.0
 python-dotenv==1.0.0
 requests==2.31.0
 redis==5.0.1
+tweepy==4.14.0
 wordfreq==3.1.1
 
 # Development

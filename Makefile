@@ -1,7 +1,7 @@
 PY_SRC=apps services shared tests
 GO_SRC=services/times_scraper
 
-.PHONY: lint format lint-go format-go build-go migrate load-puzzles extract-words wordfreq
+.PHONY: lint format lint-go format-go build-go migrate load-puzzles extract-words wordfreq social-scheduler social-worker
 
 lint:
 	ruff $(PY_SRC)
@@ -29,3 +29,9 @@ extract-words:
 
 wordfreq:
 	python services/clue_indexer/enrich_wordfreq.py
+
+social-scheduler:
+	python services/social_bot/scheduler.py
+
+social-worker:
+	python services/social_bot/worker.py
