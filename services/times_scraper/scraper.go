@@ -35,16 +35,26 @@ var (
 	// and 6-digit special numbers like "Times 120430".
 	puzzleNumRe = regexp.MustCompile(`(?i)Times\s+(?:Cryptic\s+)?(?:No\.?\s+)?[–—\s]*(\d{1,2}[,;]\d{3}|\d{4,6})`)
 	letterCountRe = regexp.MustCompile(`\([\d,]+\)\s*$`)
-	clueNumRe     = regexp.MustCompile(`^(\d+)\s+`)
+	clueNumRe     = regexp.MustCompile(`^(\d+)[\s\x{00a0}]+`)
+
+	// boldTagRe extracts the text inside the first <b> or <strong> tag.
+	boldTagRe = regexp.MustCompile(`(?i)<(?:b|strong)[^>]*>([^<]*)</(?:b|strong)>`)
+	// htmlTagRe strips all HTML tags from a fragment.
+	htmlTagRe = regexp.MustCompile(`<[^>]+>`)
 
 	// Separates the answer from the explanation in embedded-answer rows.
 	// Handles: " – "/" — ", " = ", ".  " (period+2+spaces), ". X" (period+capital),
 	// ", x" (comma+space+lowercase — blogger continuing with explanation)
 	embeddedSepRe = regexp.MustCompile(`\s+[–—]\s+|\s+=\s+|\.{1,2}\s{2,}|\.\s+[A-Z(]|,\s+[a-z]`)
 
+	// proseSepRe extends embeddedSepRe for plain-prose clue lines where 3+ spaces
+	// or a tab character separates the answer notation from the explanation.
+	proseSepRe = regexp.MustCompile(`\s+[–—]\s+|\s+=\s+|\.{1,2}\s{2,}|\.\s+[A-Z(]|,\s+[a-z]|\t|\s{3,}`)
+
 	// Strips blogger wordplay notation from a raw answer token, leaving only letters.
-	// Removes lowercase-only parenthetical hints: (lish), (l), etc.
-	lowerParenRe = regexp.MustCompile(`\([^A-Z)]*\)`)
+	// Removes parentheticals containing at least one lowercase letter: (l), (lish),
+	// (Sub reversed), (deacon is)*, etc. Superset of the old lowerParenRe.
+	mixedParenRe = regexp.MustCompile(`\([^)]*[a-z][^)]*\)`)
 	// Collapses uppercase parenthetical content: (ARDO) → ARDO, (A,L) → AL
 	upperParenRe = regexp.MustCompile(`\(([A-Z,]+)\)`)
 	// Removes remaining construction notation: commas, *, spaces around +
@@ -348,8 +358,8 @@ func parseEmbeddedClueRow(num int, cellText string) (Clue, bool) {
 //	"H + AVE"        → "HAVE"
 //	"FIRST STAGE"    → "FIRST STAGE"  (multi-word answers preserved)
 func cleanEmbeddedAnswer(raw string) string {
-	// Remove lowercase-only parentheticals: (lish), (l)
-	s := lowerParenRe.ReplaceAllString(raw, "")
+	// Remove parentheticals containing any lowercase letter: (lish), (l), (Sub reversed)
+	s := mixedParenRe.ReplaceAllString(raw, "")
 	// Collapse uppercase parentheticals: (ARDO) → ARDO, (A,L) → AL
 	s = upperParenRe.ReplaceAllStringFunc(s, func(m string) string {
 		return notationRe.ReplaceAllString(m[1:len(m)-1], "")
@@ -430,6 +440,280 @@ func parseProse(doc *goquery.Document) (across, down []Clue) {
 			Answer:      answer,
 			Explanation: explanation,
 		})
+	})
+	return
+}
+
+// parseDivProse handles blog posts where each clue and its answer occupy
+// separate <div> blocks in an alternating pattern:
+//
+//	<div>N clue text (letter_count)</div>
+//	<div>[<b>]ANSWER[</b>] explanation</div>
+//
+// Direction headers are standalone divs containing "Across" or "Down".
+// When no headers are present, direction is inferred from clue-number resets.
+func parseDivProse(doc *goquery.Document) (across, down []Clue) {
+	var current *[]Clue
+	var pending *Clue
+	lastNum := 0
+
+	doc.Find(".entry-content div").Each(func(_ int, div *goquery.Selection) {
+		// Skip container divs that hold child divs.
+		if div.Find("div").Length() > 0 {
+			return
+		}
+		text := strings.TrimSpace(div.Text())
+		if text == "" {
+			return
+		}
+
+		lower := strings.ToLower(text)
+		if lower == "across" {
+			current = &across
+			pending = nil
+			lastNum = 0
+			return
+		}
+		if lower == "down" {
+			current = &down
+			pending = nil
+			lastNum = 0
+			return
+		}
+
+		// Clue div: starts with a clue number.
+		m := clueNumRe.FindStringSubmatch(text)
+		if m != nil {
+			num, _ := strconv.Atoi(strings.TrimSpace(m[1]))
+			if current == nil {
+				current = &across
+			} else if num <= lastNum && current == &across && len(across) > 0 {
+				// Number reset → switch to Down (no explicit header present).
+				current = &down
+			}
+			lastNum = num
+
+			rest := strings.TrimSpace(text[len(m[0]):])
+
+			// Embedded answer: some bloggers put the answer in a <b> tag on the
+			// same div as the clue number. Extract immediately rather than waiting
+			// for a separate answer div.
+			boldText := strings.TrimSpace(div.Find("b,strong").First().Text())
+			if boldText != "" && boldText == strings.ToUpper(boldText) && current != nil {
+				answer := cleanEmbeddedAnswer(boldText)
+				if answer != "" {
+					explanation := ""
+					if idx := strings.Index(rest, boldText); idx != -1 {
+						explanation = strings.TrimSpace(rest[idx+len(boldText):])
+					}
+					*current = append(*current, Clue{Number: num, Answer: answer, Explanation: explanation})
+				}
+				pending = nil
+				return
+			}
+
+			// Separate clue/answer divs format: store clue and wait for answer div.
+			clueText := rest
+			letterCount := ""
+			if lm := letterCountRe.FindString(clueText); lm != "" {
+				letterCount = strings.Trim(strings.TrimSpace(lm), "()")
+				clueText = strings.TrimSpace(letterCountRe.ReplaceAllString(clueText, ""))
+			}
+			pending = &Clue{Number: num, Text: clueText, LetterCount: letterCount}
+			return
+		}
+
+		// Answer div: must follow a clue div.
+		if pending == nil {
+			return
+		}
+
+		// Format D: bold tag carries the answer.
+		boldText := strings.TrimSpace(div.Find("b,strong").First().Text())
+		var rawAnswer string
+		if boldText != "" && boldText == strings.ToUpper(boldText) {
+			rawAnswer = boldText
+		} else {
+			// Format E: plain text — take the leading run of all-caps words.
+			// Single-letter all-caps words (A, I) after the first word are treated
+			// as the start of the explanation, not part of the answer.
+			words := strings.Fields(text)
+			var ans []string
+			for i, w := range words {
+				if w == strings.ToUpper(w) && (i == 0 || len(w) > 1) {
+					ans = append(ans, w)
+				} else {
+					break
+				}
+			}
+			if len(ans) > 0 {
+				rawAnswer = strings.Join(ans, " ")
+			}
+		}
+
+		if rawAnswer == "" {
+			pending = nil
+			return
+		}
+		answer := cleanEmbeddedAnswer(rawAnswer)
+		if answer == "" {
+			pending = nil
+			return
+		}
+
+		explanation := ""
+		if idx := strings.Index(text, rawAnswer); idx != -1 {
+			rest := strings.TrimLeft(text[idx+len(rawAnswer):], " –—-")
+			explanation = strings.TrimSpace(rest)
+		}
+		pending.Answer = answer
+		pending.Explanation = explanation
+		if current != nil {
+			*current = append(*current, *pending)
+		}
+		pending = nil
+	})
+	return
+}
+
+// segPlainText strips HTML tags from a fragment and normalises non-breaking
+// spaces (U+00A0) so the result is safe to feed into regexp matchers.
+func segPlainText(html string) string {
+	s := htmlTagRe.ReplaceAllString(html, "")
+	s = strings.ReplaceAll(s, "\u00a0", " ")
+	return strings.TrimSpace(s)
+}
+
+// parsePlainProse handles old blog posts where clues appear as plain text in
+// the entry-content div, separated by <br/> tags rather than table cells.
+// The answer follows the clue number in capital letters (with optional wordplay
+// notation), then an explanation.
+//
+// Sub-formats:
+//
+//	P1/P4: "N CAPS_ANSWER   explanation"    (3+ spaces separator)
+//	P2:    "N\tCAPS_ANSWER – explanation"   (tab / en-dash separator)
+//	P3:    number alone on one line; answer on the next
+//	P5:    "N   <b>ANSWER</b> explanation"  (bold-tagged answer, NBSP after num)
+//
+// Direction sections are marked by standalone "Across" / "Down" lines.
+func parsePlainProse(doc *goquery.Document) (across, down []Clue) {
+	var current *[]Clue
+	prevLineNum := 0
+
+	// processSegment receives both the plain text of a <br/>-separated line and
+	// the bold text found within it (empty string if none). Bold text is used
+	// directly as the answer when present, avoiding ambiguity with the
+	// all-caps prefix heuristic.
+	processSegment := func(plain, bold string) {
+		plain = strings.TrimSpace(plain)
+		if plain == "" {
+			prevLineNum = 0
+			return
+		}
+
+		lower := strings.ToLower(plain)
+		if lower == "across" {
+			current = &across
+			prevLineNum = 0
+			return
+		}
+		if lower == "down" {
+			current = &down
+			prevLineNum = 0
+			return
+		}
+		if current == nil {
+			current = &across
+		}
+
+		extractAnswer := func(text, boldHint string) (answer, explanation string) {
+			// Prefer bold hint when it looks like an all-caps answer.
+			if boldHint != "" && boldHint == strings.ToUpper(boldHint) {
+				answer = cleanEmbeddedAnswer(boldHint)
+				if idx := strings.Index(text, boldHint); idx != -1 {
+					explanation = strings.TrimSpace(text[idx+len(boldHint):])
+				}
+				return
+			}
+			// proseSepRe separators (dash, equals, multi-space, tab, etc.)
+			if loc := proseSepRe.FindStringIndex(text); loc != nil {
+				rawAns := strings.TrimSpace(text[:loc[0]])
+				lastChar := text[loc[1]-1]
+				if (lastChar >= 'A' && lastChar <= 'Z') || lastChar == '(' {
+					explanation = strings.TrimSpace(text[loc[1]-1:])
+				} else {
+					explanation = strings.TrimSpace(text[loc[1]:])
+				}
+				answer = cleanEmbeddedAnswer(rawAns)
+				return
+			}
+			// All-caps prefix fallback: stop at the first word that is not all-caps,
+			// treating a lone uppercase letter (A, I) after the first word as the
+			// start of the explanation rather than part of the answer.
+			words := strings.Fields(text)
+			var ans []string
+			for i, w := range words {
+				if w == strings.ToUpper(w) && (i == 0 || len(w) > 1) {
+					ans = append(ans, w)
+				} else {
+					break
+				}
+			}
+			if len(ans) > 0 {
+				raw := strings.Join(ans, " ")
+				answer = cleanEmbeddedAnswer(raw)
+				if idx := strings.Index(text, raw); idx != -1 {
+					explanation = strings.TrimSpace(text[idx+len(raw):])
+				}
+			}
+			return
+		}
+
+		// P3: previous line was a lone number.
+		if prevLineNum > 0 {
+			if answer, expl := extractAnswer(plain, bold); answer != "" {
+				*current = append(*current, Clue{Number: prevLineNum, Answer: answer, Explanation: expl})
+			}
+			prevLineNum = 0
+			return
+		}
+
+		// Check for a bare number (P3 clue line).
+		if n, err := strconv.Atoi(plain); err == nil && n > 0 && n < 50 {
+			prevLineNum = n
+			return
+		}
+
+		// P1 / P2 / P4 / P5: line starts with "N[whitespace] …"
+		m := clueNumRe.FindStringSubmatch(plain)
+		if m == nil {
+			prevLineNum = 0
+			return
+		}
+		num, _ := strconv.Atoi(strings.TrimSpace(m[1]))
+		rest := strings.TrimSpace(plain[len(m[0]):])
+		if answer, expl := extractAnswer(rest, bold); answer != "" {
+			*current = append(*current, Clue{Number: num, Answer: answer, Explanation: expl})
+		}
+		prevLineNum = 0
+	}
+
+	doc.Find(".entry-content p").Each(func(_ int, p *goquery.Selection) {
+		// Work on the raw HTML so we can split on <br> variants before stripping
+		// tags, and extract bold text per segment before it is lost.
+		pHTML, _ := p.Html()
+		const sentinel = "\uE000"
+		pHTML = strings.ReplaceAll(pHTML, "<br/>", sentinel)
+		pHTML = strings.ReplaceAll(pHTML, "<br />", sentinel)
+		pHTML = strings.ReplaceAll(pHTML, "<br>", sentinel)
+		for _, seg := range strings.Split(pHTML, sentinel) {
+			bold := ""
+			if m := boldTagRe.FindStringSubmatch(seg); m != nil {
+				bold = strings.TrimSpace(m[1])
+			}
+			processSegment(segPlainText(seg), bold)
+		}
 	})
 	return
 }
@@ -531,9 +815,9 @@ func parseDoc(url string, doc *goquery.Document) *Crossword {
 		}
 	})
 
-	// Old format: <table cellspacing="N"> (N = 3, 4, or 5)
+	// Old format: <table cellspacing="N"> (N = 3, 4, or 5) or <table border="0" cellpadding="0">
 	if len(xwd.Across) == 0 && len(xwd.Down) == 0 {
-		doc.Find("table[cellspacing='3'],table[cellspacing='4'],table[cellspacing='5']").Each(func(_ int, table *goquery.Selection) {
+		doc.Find("table[cellspacing='3'],table[cellspacing='4'],table[cellspacing='5'],table[border='0'][cellpadding='0']").Each(func(_ int, table *goquery.Selection) {
 			// Skip tables nested inside another table (answer cells sometimes contain
 			// formatting sub-tables). ParentsFiltered checks ancestors only, not self.
 			if table.ParentsFiltered("table").Length() > 0 {
@@ -576,6 +860,17 @@ func parseDoc(url string, doc *goquery.Document) *Crossword {
 				}
 			})
 		})
+	}
+
+	// Div-prose fallback: some bloggers use alternating <div> blocks for clue and answer.
+	if len(xwd.Across) == 0 && len(xwd.Down) == 0 {
+		xwd.Across, xwd.Down = parseDivProse(doc)
+	}
+
+	// Plain-prose fallback: old posts where clues are in <br/>-separated paragraphs.
+	// The answer follows the clue number in capital letters.
+	if len(xwd.Across) == 0 && len(xwd.Down) == 0 {
+		xwd.Across, xwd.Down = parsePlainProse(doc)
 	}
 
 	return xwd
