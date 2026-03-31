@@ -27,6 +27,7 @@ from services.social_bot.generators.clue_tweet import ClueTweetGenerator
 from services.social_bot.generators.reveal_tweet import RevealTweetGenerator
 from services.social_bot.publishers import register as register_publisher, get_publisher
 from services.social_bot.publishers.twitter import TwitterPublisher
+from services.social_bot.publishers.instagram import InstagramPublisher
 from services.social_bot.models import PostRecord, PostStatus, PostType
 
 logging.basicConfig(
@@ -54,6 +55,7 @@ def _setup_registries() -> None:
     register_generator(PostType.CLUE_TWEET, ClueTweetGenerator())
     register_generator(PostType.REVEAL_TWEET, RevealTweetGenerator())
     register_publisher("twitter", TwitterPublisher())
+    register_publisher("instagram", InstagramPublisher())
 
 
 def _fetch_post(post_id: int) -> PostRecord | None:
