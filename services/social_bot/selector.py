@@ -17,13 +17,6 @@ from datetime import date
 
 from shared.clients.postgres import transaction
 
-try:
-    from wordfreq import zipf_frequency
-
-    _HAS_WORDFREQ = True
-except ImportError:
-    _HAS_WORDFREQ = False
-
 
 def select_clue_for_date(target_date: date) -> dict | None:
     """
@@ -65,14 +58,26 @@ def select_clue_for_date(target_date: date) -> dict | None:
             )
             row = cur.fetchone()
 
-    if row is None:
-        return None
+        if row is None:
+            return None
 
-    clues = row["across"]
-    if not clues:
-        return None
+        clues = row["across"]
+        if not clues:
+            return None
 
-    chosen_idx, chosen = _pick_best_clue(clues)
+        # Fetch Zipf scores for all answer words in one query.
+        answers = [
+            c.get("answer", "").lower() for c in clues if c.get("answer", "").strip()
+        ]
+        scores: dict[str, float] = {}
+        if answers:
+            cur.execute(
+                "SELECT word, zipf_score FROM word_frequency WHERE word = ANY(%s)",
+                (answers,),
+            )
+            scores = {r["word"]: r["zipf_score"] for r in cur.fetchall()}
+
+    chosen_idx, chosen = _pick_best_clue(clues, scores)
 
     answer = chosen.get("answer", "")
     letter_count = _extract_letter_count(chosen.get("text", ""), answer)
@@ -87,9 +92,11 @@ def select_clue_for_date(target_date: date) -> dict | None:
     }
 
 
-def _pick_best_clue(clues: list[dict]) -> tuple[int, dict]:
-    """Return (index, clue) for the clue with the highest wordfreq Zipf score.
-    Skips clues with no answer. Falls back to index 0."""
+def _pick_best_clue(
+    clues: list[dict], scores: dict[str, float]
+) -> tuple[int, dict]:
+    """Return (index, clue) for the clue with the highest Zipf score from the DB.
+    Skips clues with no answer. Falls back to the first clue with an answer."""
     best_idx = 0
     best_score = -1.0
     best_clue = clues[0]
@@ -98,17 +105,14 @@ def _pick_best_clue(clues: list[dict]) -> tuple[int, dict]:
         answer = clue.get("answer", "").strip()
         if not answer:
             continue
-        if i == 0:
-            best_clue = clue  # at minimum, take the first clue with an answer
-        if _HAS_WORDFREQ:
-            score = zipf_frequency(answer.lower(), "en")
-            if score > best_score:
-                best_score = score
-                best_idx = i
-                best_clue = clue
-        else:
-            # Without wordfreq, just take the first clue with an answer
-            return i, clue
+        if best_score == -1.0:
+            # Ensure we always have a valid fallback.
+            best_idx, best_clue = i, clue
+        score = scores.get(answer.lower(), 0.0)
+        if score > best_score:
+            best_score = score
+            best_idx = i
+            best_clue = clue
 
     return best_idx, best_clue
 
