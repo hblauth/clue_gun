@@ -30,10 +30,23 @@ type Crossword struct {
 }
 
 var (
-	// Matches: "Times 29503", "Times Cryptic 29496", "Times Cryptic No. 27282"
-	puzzleNumRe   = regexp.MustCompile(`(?i)Times\s+(?:Cryptic\s+)?(?:No\.?\s+)?(\d{4,5})`)
+	// Matches: "Times 29503", "Times Cryptic 29496", "Times Cryptic No. 27282", "Times 23,034"
+	puzzleNumRe   = regexp.MustCompile(`(?i)Times\s+(?:Cryptic\s+)?(?:No\.?\s+)?(\d{1,2},\d{3}|\d{4,5})`)
 	letterCountRe = regexp.MustCompile(`\([\d,]+\)\s*$`)
 	clueNumRe     = regexp.MustCompile(`^(\d+)\s+`)
+
+	// Separates the answer from the explanation in embedded-answer rows.
+	// Handles: " – "/" — ", " = ", ".  " (period+2+spaces), ". X" (period+capital),
+	// ", x" (comma+space+lowercase — blogger continuing with explanation)
+	embeddedSepRe = regexp.MustCompile(`\s+[–—]\s+|\s+=\s+|\.{1,2}\s{2,}|\.\s+[A-Z(]|,\s+[a-z]`)
+
+	// Strips blogger wordplay notation from a raw answer token, leaving only letters.
+	// Removes lowercase-only parenthetical hints: (lish), (l), etc.
+	lowerParenRe = regexp.MustCompile(`\([^A-Z)]*\)`)
+	// Collapses uppercase parenthetical content: (ARDO) → ARDO, (A,L) → AL
+	upperParenRe = regexp.MustCompile(`\(([A-Z,]+)\)`)
+	// Removes remaining construction notation: commas, *, spaces around +
+	notationRe = regexp.MustCompile(`[,*]|\s*\+\s*`)
 )
 
 func urlSlug(url string) string {
@@ -123,36 +136,213 @@ func parseNewFormatClues(rows *goquery.Selection) []Clue {
 	return clues
 }
 
-// parseOldFormatTable handles <table cellspacing="3"> where Across and Down may both
-// appear in a single table separated by plain-text direction header rows.
+// parseOldFormatTable handles old-format <table cellspacing="3|5"> tables.
+// It detects three row patterns automatically:
+//
+//	Pattern 1 (original):  [num td][clue text td] / [bold answer td][explanation td]
+//	Pattern A (embedded):  [num td][ANSWER. explanation td]  — answer in caps, no bold
+//	Pattern B (single-cell): [num<i>clue</i>] / [<strong>ANSWER</strong> explanation]
 func parseOldFormatTable(rows *goquery.Selection) (across, down []Clue) {
 	var current *[]Clue
 	i := 0
 	n := rows.Length()
 	for i < n {
 		row := rows.Eq(i)
-		firstText := strings.TrimSpace(row.Find("td").First().Text())
-		switch strings.ToLower(firstText) {
-		case "across":
+
+		// Direction header: check all cell text, bold text, and th text.
+		rowText := strings.ToLower(strings.TrimSpace(row.Text()))
+		boldText := strings.ToLower(strings.TrimSpace(row.Find("strong,b").First().Text()))
+		switch {
+		case rowText == "across" || boldText == "across":
 			current = &across
 			i++
-		case "down":
+			continue
+		case rowText == "down" || boldText == "down":
 			current = &down
 			i++
-		default:
-			if current == nil || firstText == "" || i+1 >= n {
+			continue
+		}
+
+		tds := row.Find("td")
+		// If no direction header has appeared yet, default to across so that
+		// tables without headers (bloggers who omit "Across"/"Down") still parse.
+		if current == nil && tds.Length() > 0 {
+			current = &across
+		}
+		if current == nil {
+			i++
+			continue
+		}
+		numCells := tds.Length()
+
+		switch {
+		case numCells == 0:
+			i++
+
+		case numCells == 1:
+			// Pattern B: single-cell rows alternating clue / answer.
+			// A clue row starts with a digit; an answer row starts with bold.
+			cell := tds.First()
+			if cell.Find("strong,b").Length() > 0 {
+				// Stray answer row with no preceding clue row — skip.
 				i++
 				continue
 			}
-			if c, ok := parseClueRow(rows.Eq(i), rows.Eq(i+1)); ok {
+			numStr := strings.TrimSpace(clueNumRe.FindString(cell.Text()))
+			if numStr == "" {
+				i++
+				continue
+			}
+			if i+1 >= n {
+				i++
+				continue
+			}
+			if c, ok := parseSingleCellClueRow(cell, rows.Eq(i+1)); ok {
 				*current = append(*current, c)
 				i += 2
 			} else {
 				i++
 			}
+
+		default:
+			// 2+ cells. Determine whether the answer is in the next row (Pattern 1)
+			// or embedded in this row's second cell (Pattern A).
+			numStr := strings.TrimSpace(tds.First().Text())
+			num, err := strconv.Atoi(numStr)
+			if err != nil {
+				i++
+				continue
+			}
+
+			// Look ahead: if the next row's first cell is NOT a plain number and
+			// it contains a bold tag, it's a Pattern 1 answer row.
+			isPattern1 := false
+			if i+1 < n {
+				nextRow := rows.Eq(i + 1)
+				nextFirstText := strings.TrimSpace(nextRow.Find("td,th").First().Text())
+				_, nextNumErr := strconv.Atoi(nextFirstText)
+				if nextNumErr != nil && nextRow.Find("strong,b").Length() > 0 {
+					isPattern1 = true
+				}
+			}
+
+			if isPattern1 {
+				if c, ok := parseClueRow(rows.Eq(i), rows.Eq(i+1)); ok {
+					*current = append(*current, c)
+					i += 2
+				} else {
+					i++
+				}
+			} else {
+				// Pattern A: answer embedded in second cell.
+				cellText := strings.TrimSpace(tds.Last().Text())
+				if c, ok := parseEmbeddedClueRow(num, cellText); ok {
+					*current = append(*current, c)
+				}
+				i++
+			}
 		}
 	}
 	return
+}
+
+// parseSingleCellClueRow handles Pattern B: a single <td> containing "N<i>clue (count)</i>"
+// followed by a single-cell answer row with a <strong> tag.
+func parseSingleCellClueRow(clueCell, ansRow *goquery.Selection) (Clue, bool) {
+	raw := strings.TrimSpace(clueCell.Text())
+	m := clueNumRe.FindStringSubmatch(raw)
+	if m == nil {
+		return Clue{}, false
+	}
+	num, _ := strconv.Atoi(strings.TrimSpace(m[1]))
+
+	clueText := strings.TrimSpace(raw[len(m[0]):])
+	letterCount := ""
+	if lm := letterCountRe.FindString(clueText); lm != "" {
+		letterCount = strings.Trim(strings.TrimSpace(lm), "()")
+		clueText = strings.TrimSpace(letterCountRe.ReplaceAllString(clueText, ""))
+	}
+
+	ansCell := ansRow.Find("td").First()
+	answer := strings.TrimSpace(ansCell.Find("strong,b").First().Text())
+	if answer == "" {
+		return Clue{}, false
+	}
+	fullAns := strings.TrimSpace(ansCell.Text())
+	explanation := ""
+	if idx := strings.Index(fullAns, answer); idx != -1 {
+		rest := strings.TrimLeft(fullAns[idx+len(answer):], " \u2013\u2014-")
+		explanation = strings.TrimSpace(rest)
+	}
+
+	return Clue{
+		Number:      num,
+		Text:        clueText,
+		LetterCount: letterCount,
+		Answer:      answer,
+		Explanation: explanation,
+	}, true
+}
+
+// parseEmbeddedClueRow handles Pattern A: the answer and explanation are in a single
+// cell, with the answer as leading all-caps text separated by ". ", " – ", " = ", etc.
+// No clue text is available in this format (bloggers don't repeat the clue).
+func parseEmbeddedClueRow(num int, cellText string) (Clue, bool) {
+	if cellText == "" {
+		return Clue{}, false
+	}
+	loc := embeddedSepRe.FindStringIndex(cellText)
+	var rawAnswer, explanation string
+	if loc != nil {
+		rawAnswer = strings.TrimSpace(cellText[:loc[0]])
+		// If the separator is ". X" we've consumed one char of the explanation.
+		sep := cellText[loc[0]:loc[1]]
+		if strings.HasPrefix(strings.TrimLeft(sep, " ."), "") && loc[1] > 0 {
+			lastChar := cellText[loc[1]-1]
+			if lastChar >= 'A' && lastChar <= 'Z' || lastChar == '(' {
+				explanation = strings.TrimSpace(cellText[loc[1]-1:])
+			} else {
+				explanation = strings.TrimSpace(cellText[loc[1]:])
+			}
+		}
+	} else {
+		rawAnswer = strings.TrimSpace(cellText)
+	}
+
+	answer := cleanEmbeddedAnswer(rawAnswer)
+	if answer == "" {
+		return Clue{}, false
+	}
+	return Clue{
+		Number:      num,
+		Answer:      answer,
+		Explanation: explanation,
+	}, true
+}
+
+// cleanEmbeddedAnswer strips blogger wordplay notation from a raw answer token,
+// returning only the uppercase letters of the actual answer.
+//
+//	"CHAR,LOCK"      → "CHARLOCK"
+//	"L(ARDO)ON"      → "LARDOON"   (uppercase parens kept, lowercase discarded)
+//	"TH(RIFT)Y"      → "THRIFTY"
+//	"H + AVE"        → "HAVE"
+//	"FIRST STAGE"    → "FIRST STAGE"  (multi-word answers preserved)
+func cleanEmbeddedAnswer(raw string) string {
+	// Remove lowercase-only parentheticals: (lish), (l)
+	s := lowerParenRe.ReplaceAllString(raw, "")
+	// Collapse uppercase parentheticals: (ARDO) → ARDO, (A,L) → AL
+	s = upperParenRe.ReplaceAllStringFunc(s, func(m string) string {
+		return notationRe.ReplaceAllString(m[1:len(m)-1], "")
+	})
+	// Strip commas, *, and + with surrounding spaces
+	s = notationRe.ReplaceAllString(s, "")
+	s = strings.TrimSpace(s)
+	// Must start with an uppercase letter to be a valid answer.
+	if len(s) == 0 || s[0] < 'A' || s[0] > 'Z' {
+		return ""
+	}
+	return s
 }
 
 // parseProse handles the Saturday post format where clues are in <p> tags:
@@ -244,7 +434,7 @@ func Scrape(url string) (*Crossword, error) {
 		}
 		xwd := &Crossword{URL: url, Date: date}
 		if m := puzzleNumRe.FindStringSubmatch(title); m != nil {
-			xwd.PuzzleNumber, _ = strconv.Atoi(m[1])
+			xwd.PuzzleNumber, _ = strconv.Atoi(strings.ReplaceAll(m[1], ",", ""))
 		}
 		doc, err := goquery.NewDocumentFromReader(bytes.NewReader(html))
 		if err != nil {
@@ -285,7 +475,7 @@ func parseDoc(url string, doc *goquery.Document) *Crossword {
 
 	title := strings.TrimSpace(doc.Find("h1.entry-title").First().Text())
 	if m := puzzleNumRe.FindStringSubmatch(title); m != nil {
-		xwd.PuzzleNumber, _ = strconv.Atoi(m[1])
+		xwd.PuzzleNumber, _ = strconv.Atoi(strings.ReplaceAll(m[1], ",", ""))
 	}
 	xwd.Date = strings.TrimSpace(doc.Find("time.entry-date.published").First().Text())
 	if xwd.Date == "" {
@@ -316,11 +506,18 @@ func parseDoc(url string, doc *goquery.Document) *Crossword {
 	if len(xwd.Across) == 0 && len(xwd.Down) == 0 {
 		doc.Find("table[cellspacing='3'],table[cellspacing='5']").Each(func(_ int, table *goquery.Selection) {
 			ac, dn := parseOldFormatTable(table.Find("tr"))
+			// If both directions came back empty for down (no direction headers in table),
+			// assign across clues to whichever direction is still missing.
 			if len(xwd.Across) == 0 {
 				xwd.Across = ac
-			}
-			if len(xwd.Down) == 0 {
 				xwd.Down = dn
+			} else if len(xwd.Down) == 0 {
+				// Second table: treat its across result as down if it has no header.
+				if len(dn) == 0 && len(ac) > 0 {
+					xwd.Down = ac
+				} else {
+					xwd.Down = dn
+				}
 			}
 		})
 	}
