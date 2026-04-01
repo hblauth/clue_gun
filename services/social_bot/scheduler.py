@@ -83,15 +83,17 @@ def _create_daily_posts_if_needed() -> None:
     clue_key = f"clue_tweet:{today.isoformat()}"
     reveal_key = f"reveal_tweet:{tomorrow.isoformat()}"
 
+    ig_key = f"image_card_tweet:{today.isoformat()}"
+
     with transaction() as cur:
         cur.execute(
-            "SELECT id FROM social_posts WHERE idempotency_key IN (%s, %s)",
-            (clue_key, reveal_key),
+            "SELECT idempotency_key FROM social_posts WHERE idempotency_key IN (%s, %s, %s)",
+            (clue_key, reveal_key, ig_key),
         )
-        existing = {row["id"] for row in cur.fetchall()}
+        existing_keys = {row["idempotency_key"] for row in cur.fetchall()}
 
-    # Both already exist
-    if len(existing) >= 2:
+    # All three already exist
+    if len(existing_keys) >= 3:
         return
 
     clue_data = select_clue_for_date(today)
@@ -102,6 +104,7 @@ def _create_daily_posts_if_needed() -> None:
     puzzle_num = clue_data["puzzle_number"]
     clue_key = f"clue_tweet:{puzzle_num}:{today.isoformat()}"
     reveal_key = f"reveal_tweet:{puzzle_num}:{tomorrow.isoformat()}"
+    ig_key = f"image_card_tweet:{puzzle_num}:{today.isoformat()}"
 
     scheduled_today = datetime(
         today.year, today.month, today.day, POST_HOUR_UTC, 0, 0, tzinfo=timezone.utc
@@ -111,27 +114,24 @@ def _create_daily_posts_if_needed() -> None:
     )
 
     if DRY_RUN:
-        logger.info(
-            "[DRY RUN] Would schedule: clue_tweet puzzle=%d clue=%s at %s",
-            puzzle_num, clue_data["clue_ref"], scheduled_today,
-        )
-        logger.info(
-            "[DRY RUN] Would schedule: reveal_tweet puzzle=%d at %s",
-            puzzle_num, scheduled_tomorrow,
-        )
+        logger.info("[DRY RUN] Would schedule: clue_tweet puzzle=%d clue=%s at %s",
+                    puzzle_num, clue_data["clue_ref"], scheduled_today)
+        logger.info("[DRY RUN] Would schedule: image_card_tweet puzzle=%d at %s",
+                    puzzle_num, scheduled_today)
+        logger.info("[DRY RUN] Would schedule: reveal_tweet puzzle=%d at %s",
+                    puzzle_num, scheduled_tomorrow)
         return
 
     conn = get_conn()
     try:
         with conn, conn.cursor() as cur:
-            # Insert clue_tweet; get its ID so reveal_tweet can reference it
+            # clue_tweet (Twitter)
             cur.execute(
                 """
                 INSERT INTO social_posts
                     (post_type, platform, puzzle_number, clue_ref,
                      scheduled_for, idempotency_key)
-                VALUES
-                    ('clue_tweet', 'twitter', %s, %s, %s, %s)
+                VALUES ('clue_tweet', 'twitter', %s, %s, %s, %s)
                 ON CONFLICT (idempotency_key) DO NOTHING
                 RETURNING id
                 """,
@@ -139,23 +139,29 @@ def _create_daily_posts_if_needed() -> None:
             )
             row = cur.fetchone()
             clue_post_id = row[0] if row else None
-
             if clue_post_id is None:
-                # Was already inserted concurrently; fetch the real ID
-                cur.execute(
-                    "SELECT id FROM social_posts WHERE idempotency_key = %s",
-                    (clue_key,),
-                )
+                cur.execute("SELECT id FROM social_posts WHERE idempotency_key = %s", (clue_key,))
                 clue_post_id = cur.fetchone()[0]
 
-            # Insert reveal_tweet linked to the clue_tweet
+            # image_card_tweet (Instagram) — same time as clue tweet
+            cur.execute(
+                """
+                INSERT INTO social_posts
+                    (post_type, platform, puzzle_number, clue_ref,
+                     scheduled_for, idempotency_key)
+                VALUES ('image_card_tweet', 'instagram', %s, %s, %s, %s)
+                ON CONFLICT (idempotency_key) DO NOTHING
+                """,
+                (puzzle_num, clue_data["clue_ref"], scheduled_today, ig_key),
+            )
+
+            # reveal_tweet (Twitter) — next day, threaded reply to clue_tweet
             cur.execute(
                 """
                 INSERT INTO social_posts
                     (post_type, platform, puzzle_number, clue_ref,
                      parent_post_id, scheduled_for, idempotency_key)
-                VALUES
-                    ('reveal_tweet', 'twitter', %s, %s, %s, %s, %s)
+                VALUES ('reveal_tweet', 'twitter', %s, %s, %s, %s, %s)
                 ON CONFLICT (idempotency_key) DO NOTHING
                 """,
                 (puzzle_num, clue_data["clue_ref"], clue_post_id, scheduled_tomorrow, reveal_key),
@@ -164,7 +170,7 @@ def _create_daily_posts_if_needed() -> None:
         conn.close()
 
     logger.info(
-        "Scheduled puzzle #%d: clue_tweet at %s, reveal_tweet at %s",
+        "Scheduled puzzle #%d: clue_tweet+image_card at %s, reveal_tweet at %s",
         puzzle_num, scheduled_today, scheduled_tomorrow,
     )
 
