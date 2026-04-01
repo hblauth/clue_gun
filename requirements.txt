@@ -11,6 +11,7 @@ sqlalchemy==2.0.23
 opencv-python==4.8.1.78
 pytesseract==0.3.10
 pillow==10.1.0
+pillow-heif==0.13.1
 
 # Utilities
 python-dotenv==1.0.0

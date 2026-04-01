@@ -1,7 +1,7 @@
 PY_SRC=apps services shared tests
 GO_SRC=services/times_scraper
 
-.PHONY: lint format lint-go format-go build-go migrate load-puzzles load-wordfreq extract-words wordfreq social-scheduler social-worker bot api
+.PHONY: lint format lint-go format-go build-go migrate load-puzzles load-wordfreq extract-words wordfreq social-scheduler social-worker bot api process-image
 
 lint:
 	ruff $(PY_SRC)
@@ -48,3 +48,7 @@ social-worker:
 # Run scheduler and worker together in the foreground (Ctrl-C stops both)
 bot:
 	python3 services/social_bot/scheduler.py & python3 services/social_bot/worker.py; kill %1 2>/dev/null
+
+# Process a crossword photo: make process-image IMG=path/to/photo.jpg [PUZZLE=28397]
+process-image:
+	python3 services/image_processor/pipeline.py $(IMG) $(if $(PUZZLE),--puzzle-number $(PUZZLE))
