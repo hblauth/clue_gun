@@ -337,6 +337,15 @@ def ocr_clue_number(cell: np.ndarray) -> Optional[int]:
 # Stage 6 — Annotation detection in the printed clue list
 # ---------------------------------------------------------------------------
 
+def _region_ink_density(region: np.ndarray) -> float:
+    """Return fraction of dark pixels after Otsu thresholding."""
+    if region.size == 0:
+        return 0.0
+    gray = cv2.cvtColor(region, cv2.COLOR_RGB2GRAY)
+    _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+    return float(np.sum(binary > 0)) / max(binary.size, 1)
+
+
 def find_clue_list_region(
     img: np.ndarray,
     grid_bbox: Optional[tuple[int, int, int, int]],
@@ -345,10 +354,11 @@ def find_clue_list_region(
     Return the sub-image that contains the printed clue list (outside the grid),
     plus the (offset_x, offset_y) of that sub-image in the original image.
 
-    Typical newspaper layout has clues:
-      - Below the grid   (portrait phone shot)
-      - To the right     (landscape or tabletop shot)
-    We pick whichever non-grid area is larger.
+    Typical newspaper layout has clues below or to the side of the grid.
+    Candidates are ranked by area, then validated by ink density: clue text
+    has moderate density (2–40%).  Regions that are nearly solid black (another
+    newspaper page, shadow, or grid content) are skipped so the next-best
+    candidate is tried.
     """
     h, w = img.shape[:2]
 
@@ -361,27 +371,30 @@ def find_clue_list_region(
 
     below_h = max(0, h - grid_bottom)
     right_w = max(0, w - grid_right)
+    left_w  = max(0, gx)
 
-    # Also consider the area to the left of the grid
-    left_w = max(0, gx)
+    candidates: list[tuple[int, np.ndarray, int, int]] = []
+    if below_h > 30:
+        candidates.append((below_h * w,  img[grid_bottom:h, 0:w],  0,         grid_bottom))
+    if right_w > 30:
+        candidates.append((right_w * h,  img[0:h, grid_right:w],   grid_right, 0))
+    if left_w > 30:
+        candidates.append((left_w * h,   img[0:h, 0:gx],           0,         0))
 
-    below_area = below_h * w
-    right_area = right_w * h
-    left_area = left_w * h
+    # Sort largest first; pick the first with text-like ink density.
+    candidates.sort(key=lambda t: t[0], reverse=True)
+    for area, region, ox, oy in candidates:
+        density = _region_ink_density(region)
+        logger.debug("Clue region candidate: area=%d density=%.3f offset=(%d,%d)", area, density, ox, oy)
+        if 0.02 <= density <= 0.40:
+            return region, ox, oy
 
-    if below_area >= right_area and below_area >= left_area and below_h > 30:
-        region = img[grid_bottom:h, 0:w]
-        return region, 0, grid_bottom
-    elif right_area >= left_area and right_w > 30:
-        region = img[0:h, grid_right:w]
-        return region, grid_right, 0
-    elif left_w > 30:
-        region = img[0:h, 0:gx]
-        return region, 0, 0
-    else:
-        # Fallback: lower half of image
-        mid_y = h // 2
-        return img[mid_y:h, 0:w], 0, mid_y
+    # Fallback: largest candidate regardless of density, or lower-half heuristic.
+    if candidates:
+        _, region, ox, oy = candidates[0]
+        return region, ox, oy
+    mid_y = h // 2
+    return img[mid_y:h, 0:w], 0, mid_y
 
 
 def segment_clue_rows(

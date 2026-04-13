@@ -192,6 +192,27 @@ def test_find_clue_list_region_grid_at_top():
     assert oy == 200  # clue region starts at y=200
 
 
+def test_find_clue_list_region_prefers_text_density_over_area():
+    """When the larger candidate is nearly solid black, pick the smaller one with text-like density."""
+    rng = np.random.default_rng(0)
+    h, w = 400, 600
+    img = np.full((h, w, 3), 255, dtype=np.uint8)
+
+    # Left region (x=0-200): sparse text-like ink (10% dark pixels)
+    img[50:350, 0:200] = rng.choice([0, 255], size=(300, 200, 3), p=[0.10, 0.90]).astype(np.uint8)
+
+    # Right region (x=400-600): nearly solid black (another dense page)
+    img[:, 400:600] = 0
+
+    # Grid in the middle (x=200-400)
+    grid_bbox = (200, 0, 200, h)
+    region, ox, oy = find_clue_list_region(img, grid_bbox)
+
+    # Right is larger (200*400 > 200*400, tie in area — left_w=200=right_w=200 actually)
+    # But right is solid black (density≈1), left has sparse ink (density≈0.10) → left wins
+    assert ox == 0  # left region selected, not the dense right region
+
+
 # ---------------------------------------------------------------------------
 # GridResult / CellResult / ClueAnnotation dataclasses
 # ---------------------------------------------------------------------------
