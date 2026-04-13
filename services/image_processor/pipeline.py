@@ -1034,6 +1034,7 @@ def classify_annotation(cell: np.ndarray) -> tuple[Optional[str], float]:
     if peri < 20:
         return None, 0.90
 
+
     M = cv2.moments(c)
     if M["m00"] == 0:
         return None, 0.90
@@ -1262,20 +1263,9 @@ def _scan_column_for_stars(
     """
     Scan a single clue column (ACROSS or DOWN) for hand-drawn star marks.
 
-    Strategy:
-      1. Find the "number zone" — the `num_zone_px`-wide strip at the inner edge
-         of the column.  Clue numbers are printed at this inner edge; stars are
-         drawn on or next to those numbers.
-         - scan_from_right=False → numbers are at the LEFT  (inner edge of right col)
-         - scan_from_right=True  → numbers are at the RIGHT (inner edge of left col)
-      2. Binarise with adaptive threshold.
-      3. Find contours in size range [min_star_area, max_star_area] with roughly
-         square bounding box.
-      4. Apply the radial-peaks star test to each candidate contour.
-      5. For each confirmed star, OCR the surrounding horizontal strip to get
-         the clue number.
-
-    Returns list of ClueAnnotation objects.
+    Finds contours in the number-zone strip, filters by area/shape/dimension,
+    runs the radial-peaks + spacing-uniformity classifier, then maps each
+    detection to a clue number via clue_map.
     """
     if col_img.size == 0:
         return []
@@ -1287,18 +1277,15 @@ def _scan_column_for_stars(
         nz_start = max(0, text_end - num_zone_px)
         nz_end = text_end + 1
         num_zone = col_img[:, nz_start:nz_end]
-        nz_offset = nz_start
     else:
         text_start = _find_text_start_x(col_img)
         nz_start = text_start
         nz_end = min(cw, text_start + num_zone_px)
         num_zone = col_img[:, nz_start:nz_end]
-        nz_offset = nz_start
 
     logger.debug("Column dir=%s scan_from_right=%s: num_zone x=[%d:%d]",
                  direction, scan_from_right, nz_start, nz_end)
 
-    # Use provided map (from DB sequence) or fall back to OCR-based map.
     if clue_map is None:
         clue_map = _build_clue_number_map(col_img)
 
@@ -1310,16 +1297,14 @@ def _scan_column_for_stars(
     contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
 
     found: list[ClueAnnotation] = []
-    seen_y: list[int] = []  # prevent duplicate detections at the same y
+    seen_y: list[int] = []
 
     for c in contours:
         area = cv2.contourArea(c)
         if area < min_star_area or area > max_star_area:
             continue
 
-        # Stage 1: reject line-like strokes (underlines, ticks, strikethroughs).
         if _classify_contour_shape(c) == "line":
-            logger.debug("Skipping line-shaped contour (area=%.0f)", area)
             continue
 
         x, y, w, h = cv2.boundingRect(c)
@@ -1328,15 +1313,12 @@ def _scan_column_for_stars(
             continue
         if w < min_star_dim or h < min_star_dim:
             continue
-        # Reject blobs that span almost the full zone width (wide text smears, not stars)
         if w > nz_w * 0.75:
             continue
 
-        # Avoid duplicate detections within 30px of each other (same star)
         if any(abs(y - py) < 30 for py in seen_y):
             continue
 
-        # Crop the contour region with padding, run the radial-peaks test
         pad = max(4, min(w, h) // 4)
         crop = num_zone[max(0, y - pad):y + h + pad, max(0, x - pad):x + w + pad]
         annotation, confidence = classify_annotation(crop)
@@ -1346,13 +1328,9 @@ def _scan_column_for_stars(
 
         seen_y.append(y)
 
-        # Look up the clue number from the pre-built column map.
         star_y_center = y + h // 2
         clue_num = _lookup_clue_number(clue_map, star_y_center)
-
         if clue_num is None:
-            logger.debug("Star at y=%d dir=%s — no clue number in map within range; skipping",
-                         y, direction)
             continue
 
         logger.info("Star on %d%s (conf=%.2f, y=%d)", clue_num, direction, confidence, y)
@@ -1364,6 +1342,7 @@ def _scan_column_for_stars(
         ))
 
     return found
+
 
 
 def detect_stars_in_clue_list(
