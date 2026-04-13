@@ -2,6 +2,7 @@
 import sys
 import math
 from pathlib import Path
+from unittest.mock import patch
 
 import cv2
 import numpy as np
@@ -18,6 +19,8 @@ from services.image_processor.pipeline import (
     _find_clue_starts_by_projection,
     _build_clue_map_from_sequence,
     _lookup_clue_number,
+    _suppress_light_ink,
+    _classify_contour_shape,
     classify_annotation,
     deskew,
     segment_clue_rows,
@@ -224,20 +227,26 @@ def _make_col_image(
     """
     Synthetic column image: white background with n_clues numbered clue rows.
 
-    Each row has a solid dark rectangle at x=42–65 (the number zone that
-    _find_clue_starts_by_projection scans at x=40–90).  The body is kept
-    intentionally sparse so total band ink stays below the heading-filter
-    threshold (band_h * col_w * 0.08).
+    The number zone block is deliberately narrow (5px wide) so the per-column
+    ink density stays within the [1%, 35%] range that _find_text_start_x
+    expects for "text-like" columns.  At 5px wide the column still delivers
+    5 ink pixels per row — above the min_ink=4 threshold used by the band
+    detector — and 5*line_h / total_h ≈ 14% which is safely in range.
 
     Row y-centres: gap + i*(line_h+gap) + line_h//2.
     """
-    total_h = n_clues * (line_h + gap) + gap
+    # Ensure per-column ink density stays below _find_text_start_x's 35% ceiling.
+    # n_clues * line_h ink pixels need at least (n_clues * line_h / 0.35) rows.
+    # A 1 200px minimum covers all test cases comfortably.
+    nat_h = n_clues * (line_h + gap) + gap
+    total_h = max(nat_h, 1200)
     img = np.full((total_h, col_w, 3), 255, dtype=np.uint8)
     for i in range(n_clues):
         y_top = gap + i * (line_h + gap)
         y_bot = y_top + line_h
-        # Clue number digit block inside number zone (x=40–90)
-        cv2.rectangle(img, (42, y_top + 5), (65, y_bot - 5), (0, 0, 0), -1)
+        # Narrow digit-like block inside the number zone (x=42–46, 5px wide).
+        # Keeps per-column ink density ~14% — within _find_text_start_x's [1–35%] window.
+        cv2.rectangle(img, (42, y_top + 5), (46, y_bot - 5), (0, 0, 0), -1)
         # Sparse text body: two narrow character-like blocks (well under heading threshold)
         cv2.rectangle(img, (100, y_top + 15), (108, y_bot - 15), (60, 60, 60), -1)
         cv2.rectangle(img, (130, y_top + 15), (138, y_bot - 15), (60, 60, 60), -1)
@@ -290,60 +299,109 @@ def test_find_clue_starts_y_centres_are_approximate():
 
 # ---------------------------------------------------------------------------
 # _build_clue_map_from_sequence
+# (mocks _build_clue_number_map — synthetic images have no OCR-readable digits)
 # ---------------------------------------------------------------------------
 
-def test_build_clue_map_perfect_match():
-    """When n_detected == n_expected every clue is paired in order."""
+_PATCH = "services.image_processor.pipeline._build_clue_number_map"
+
+
+def test_build_clue_map_all_ocrd():
+    """All clues OCR'd: result pairs each number with its y-position."""
     seq = [1, 5, 9, 14, 18]
+    ocr = [(100, 1), (200, 5), (300, 9), (400, 14), (500, 18)]
     col = _make_col_image(n_clues=len(seq))
-    result = _build_clue_map_from_sequence(col, seq)
+    with patch(_PATCH, return_value=ocr):
+        result = _build_clue_map_from_sequence(col, seq)
     assert len(result) == len(seq)
-    nums = [num for _, num in result]
-    assert nums == seq
+    assert [num for _, num in result] == seq
+    assert [y for y, _ in result] == [100, 200, 300, 400, 500]
 
 
 def test_build_clue_map_returns_sorted_by_y():
     seq = [2, 7, 11]
+    ocr = [(300, 11), (100, 2), (200, 7)]  # deliberately unsorted
     col = _make_col_image(n_clues=len(seq))
-    result = _build_clue_map_from_sequence(col, seq)
+    with patch(_PATCH, return_value=ocr):
+        result = _build_clue_map_from_sequence(col, seq)
     ys = [y for y, _ in result]
     assert ys == sorted(ys)
 
 
 def test_build_clue_map_empty_sequence():
     col = _make_col_image(n_clues=3)
-    result = _build_clue_map_from_sequence(col, [])
-    # No sequence → nothing to pair
+    with patch(_PATCH, return_value=[(100, 1), (200, 3)]):
+        result = _build_clue_map_from_sequence(col, [])
     assert result == []
 
 
-def test_build_clue_map_empty_image():
-    blank = np.full((200, 400, 3), 255, dtype=np.uint8)
-    result = _build_clue_map_from_sequence(blank, [1, 2, 3])
-    # No detected starts → empty
-    assert result == []
-
-
-def test_build_clue_map_more_detections_than_expected():
-    """Extra detected starts are trimmed to match the sequence length."""
-    seq = [3, 7]
-    # Image with 4 clue rows, but sequence only names 2
-    col = _make_col_image(n_clues=4)
-    result = _build_clue_map_from_sequence(col, seq)
-    assert len(result) == len(seq)
-    nums = [num for _, num in result]
-    assert nums == seq
-
-
-def test_build_clue_map_fewer_detections_than_expected():
-    """Fewer detections than expected: result is padded/interpolated to full length."""
-    seq = [1, 5, 9, 14, 18, 22]
-    # Only 3 real clue rows in the image
+def test_build_clue_map_ocr_returns_nothing():
+    """When OCR finds nothing, fall back to uniform spacing from projection bounds."""
     col = _make_col_image(n_clues=3)
-    result = _build_clue_map_from_sequence(col, seq)
-    assert len(result) == len(seq)
+    with patch(_PATCH, return_value=[]):
+        result = _build_clue_map_from_sequence(col, [1, 3, 5])
+    # Fallback produces a full map in order rather than empty list
+    assert len(result) == 3
+    ys = [y for y, _ in result]
+    nums = [n for _, n in result]
+    assert ys == sorted(ys)
+    assert set(nums) == {1, 3, 5}
+
+
+def test_build_clue_map_interpolates_middle():
+    """Missing clues in the middle are interpolated between OCR'd neighbours."""
+    seq = [1, 5, 9, 14, 18]
+    # 9 and 14 are starred/missing from OCR
+    ocr = [(100, 1), (200, 5), (500, 18)]
+    col = _make_col_image(n_clues=len(seq))
+    with patch(_PATCH, return_value=ocr):
+        result = _build_clue_map_from_sequence(col, seq)
+    assert len(result) == 5
+    result_dict = {num: y for y, num in result}
+    # 9 is at seq index 2 out of [1,5,9,14,18]; 14 is at index 3.
+    # Between y=200 (idx 1) and y=500 (idx 4):
+    assert 200 < result_dict[9]  < 500
+    assert 200 < result_dict[14] < 500
+    assert result_dict[9] < result_dict[14]
+
+
+def test_build_clue_map_interpolates_leading():
+    """Missing clues before the first OCR hit are extrapolated backwards."""
+    seq = [1, 5, 9]
+    ocr = [(300, 9)]  # only last clue found
+    col = _make_col_image(n_clues=len(seq))
+    with patch(_PATCH, return_value=ocr):
+        result = _build_clue_map_from_sequence(col, seq)
+    assert len(result) == 3
+    result_dict = {num: y for y, num in result}
+    # Extrapolated entries may be clamped to 0 at the column boundary,
+    # so use <= to allow ties at y=0.
+    assert result_dict[1] <= result_dict[5] <= result_dict[9]
+    assert result_dict[9] == 300
+
+
+def test_build_clue_map_interpolates_trailing():
+    """Missing clues after the last OCR hit are extrapolated forwards."""
+    seq = [1, 5, 9]
+    ocr = [(100, 1)]  # only first clue found
+    col = _make_col_image(n_clues=len(seq))
+    with patch(_PATCH, return_value=ocr):
+        result = _build_clue_map_from_sequence(col, seq)
+    assert len(result) == 3
+    result_dict = {num: y for y, num in result}
+    assert result_dict[1] < result_dict[5] < result_dict[9]
+    assert result_dict[1] == 100
+
+
+def test_build_clue_map_ignores_ocr_numbers_not_in_sequence():
+    """Extra OCR tokens whose numbers aren't in the sequence are discarded."""
+    seq = [1, 5, 9]
+    ocr = [(100, 1), (200, 5), (300, 9), (350, 27)]  # 27 not in seq
+    col = _make_col_image(n_clues=len(seq))
+    with patch(_PATCH, return_value=ocr):
+        result = _build_clue_map_from_sequence(col, seq)
     nums = [num for _, num in result]
-    assert nums == seq
+    assert 27 not in nums
+    assert len(result) == 3
 
 
 # ---------------------------------------------------------------------------
@@ -386,3 +444,146 @@ def test_lookup_ties_broken_by_first_min():
     # star_y=150 is 50px from both
     result = _lookup_clue_number(clue_map, 150)
     assert result in (2, 8)  # either is acceptable; just confirm no crash
+
+
+# ---------------------------------------------------------------------------
+# _suppress_light_ink
+# ---------------------------------------------------------------------------
+
+def test_suppress_light_ink_removes_star_ink():
+    """Pixels at star-ink brightness (~157) are set to 255."""
+    gray = np.array([[157, 200, 255]], dtype=np.uint8)
+    result = _suppress_light_ink(gray, threshold=140)
+    assert result[0, 0] == 255
+    assert result[0, 1] == 255
+    assert result[0, 2] == 255
+
+
+def test_suppress_light_ink_preserves_printed_text():
+    """Pixels at printed-text brightness (~115) survive unchanged."""
+    gray = np.array([[80, 115, 140]], dtype=np.uint8)
+    result = _suppress_light_ink(gray, threshold=140)
+    assert result[0, 0] == 80
+    assert result[0, 1] == 115
+    assert result[0, 2] == 140  # exactly at threshold is kept
+
+
+def test_suppress_light_ink_does_not_modify_input():
+    """The input array is not mutated."""
+    gray = np.array([[100, 157, 200]], dtype=np.uint8)
+    original = gray.copy()
+    _suppress_light_ink(gray)
+    np.testing.assert_array_equal(gray, original)
+
+
+def test_suppress_light_ink_custom_threshold():
+    gray = np.array([[100, 120, 160]], dtype=np.uint8)
+    result = _suppress_light_ink(gray, threshold=110)
+    assert result[0, 0] == 100   # 100 <= 110, kept
+    assert result[0, 1] == 255   # 120 > 110, suppressed
+    assert result[0, 2] == 255   # 160 > 110, suppressed
+
+
+def test_suppress_light_ink_leaves_clean_column_unchanged():
+    """A column with only printed text (no star ink) is unaffected."""
+    col = _make_col_image(n_clues=3)
+    gray = cv2.cvtColor(col, cv2.COLOR_RGB2GRAY)
+    result = _suppress_light_ink(gray, threshold=140)
+    # _make_col_image uses (0,0,0) and (60,60,60) — all well below 140
+    np.testing.assert_array_equal(result, gray)
+
+
+def test_find_clue_starts_ignores_star_ink_between_rows():
+    """Star-ink patches in the gap between clue rows should not create extra detections."""
+    n = 4
+    col = _make_col_image(n_clues=n)
+    line_h, gap = 60, 10
+    # Paint star-ink gray (157) in the blank gap between row 1 and row 2,
+    # overlapping the number zone — this would register as extra ink without suppression.
+    gap_y = gap + 1 * (line_h + gap) + line_h  # bottom of row 1
+    col[gap_y: gap_y + gap, 42:65] = (157, 157, 157)
+    starts = _find_clue_starts_by_projection(col)
+    assert len(starts) == n
+
+
+# ---------------------------------------------------------------------------
+# _classify_contour_shape — helpers
+# ---------------------------------------------------------------------------
+
+def _contour_from_filled_rect(x1: int, y1: int, x2: int, y2: int,
+                               canvas: tuple[int, int] = (300, 300)) -> np.ndarray:
+    """Return a CHAIN_APPROX_NONE contour of a filled axis-aligned rectangle."""
+    img = np.zeros(canvas, dtype=np.uint8)
+    cv2.rectangle(img, (x1, y1), (x2, y2), 255, -1)
+    contours, _ = cv2.findContours(img, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+    return contours[0]
+
+
+def _contour_from_rotated_rect(cx: int, cy: int, w: int, h: int, angle_deg: float,
+                                canvas: tuple[int, int] = (300, 300)) -> np.ndarray:
+    """Return a contour of a filled rotated rectangle (simulates diagonal marks)."""
+    img = np.zeros(canvas, dtype=np.uint8)
+    box = cv2.boxPoints(((cx, cy), (w, h), angle_deg))
+    cv2.fillPoly(img, [np.int32(box)], 255)
+    contours, _ = cv2.findContours(img, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+    return contours[0]
+
+
+# ---------------------------------------------------------------------------
+# _classify_contour_shape — tests
+# ---------------------------------------------------------------------------
+
+def test_classify_contour_shape_horizontal_line():
+    """Wide flat rectangle (e.g. an underline) is classified as 'line'."""
+    c = _contour_from_filled_rect(10, 100, 120, 108)  # 110×8 → aspect ≈ 13.8
+    assert _classify_contour_shape(c) == "line"
+
+
+def test_classify_contour_shape_vertical_line():
+    """Tall narrow rectangle (e.g. a tick mark) is classified as 'line'."""
+    c = _contour_from_filled_rect(100, 10, 108, 90)  # 8×80 → aspect = 10
+    assert _classify_contour_shape(c) == "line"
+
+
+def test_classify_contour_shape_diagonal_line():
+    """A rotated elongated rectangle is classified as 'line' via minAreaRect."""
+    c = _contour_from_rotated_rect(150, 150, 100, 8, angle_deg=45)  # 100×8 at 45°
+    assert _classify_contour_shape(c) == "line"
+
+
+def test_classify_contour_shape_square_blob():
+    """A near-square blob is classified as 'blob'."""
+    c = _contour_from_filled_rect(50, 50, 110, 110)  # 60×60 → aspect = 1.0
+    assert _classify_contour_shape(c) == "blob"
+
+
+def test_classify_contour_shape_slightly_rectangular_blob():
+    """A 2:1 rectangle is well under the line threshold and classified as 'blob'."""
+    c = _contour_from_filled_rect(50, 50, 150, 100)  # 100×50 → aspect = 2.0
+    assert _classify_contour_shape(c) == "blob"
+
+
+def test_classify_contour_shape_too_few_points():
+    """Contours with fewer than 5 points pass through as 'blob' for stage-2 evaluation."""
+    tiny = np.array([[[0, 0]], [[10, 0]], [[10, 10]], [[0, 10]]], dtype=np.int32)
+    assert _classify_contour_shape(tiny) == "blob"
+
+
+def test_classify_contour_shape_at_threshold_boundary():
+    """Aspect ratio exactly at 3.0 is 'blob'; just above is 'line'."""
+    # 3:1 rectangle → aspect = 3.0 → blob (threshold is strictly > 3.0)
+    blob = _contour_from_filled_rect(10, 10, 70, 30)  # 60×20 → aspect = 3.0
+    assert _classify_contour_shape(blob) == "blob"
+    # 4:1 rectangle → aspect = 4.0 → line
+    line = _contour_from_filled_rect(10, 10, 90, 30)  # 80×20 → aspect = 4.0
+    assert _classify_contour_shape(line) == "line"
+
+
+def test_classify_contour_shape_degenerate_passes_through():
+    """A degenerate contour (short_side < 1) passes through as 'blob', not silently dropped."""
+    # A single-column strip has effectively zero short side in its minAreaRect.
+    # Create via a very thin 1-pixel wide rectangle.
+    img = np.zeros((100, 100), np.uint8)
+    img[10:90, 50] = 255  # single-pixel column
+    contours, _ = cv2.findContours(img, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+    assert _classify_contour_shape(contours[0]) == "blob"

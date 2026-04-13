@@ -153,9 +153,10 @@ def _find_grid_contour(img: np.ndarray):
 
     for c in candidates[:10]:
         peri = cv2.arcLength(c, True)
-        approx = cv2.approxPolyDP(c, 0.02 * peri, True)
-        if len(approx) == 4:
-            return approx
+        for eps_factor in (0.02, 0.04, 0.06, 0.08, 0.10, 0.12):
+            approx = cv2.approxPolyDP(c, eps_factor * peri, True)
+            if len(approx) == 4:
+                return approx
 
     return None
 
@@ -510,39 +511,133 @@ def _load_clue_sequences(puzzle_number: int) -> Optional[dict]:
     return None
 
 
+def _suppress_light_ink(gray: np.ndarray, threshold: int = 140) -> np.ndarray:
+    """
+    Return a copy of `gray` with pixels brighter than `threshold` set to 255.
+
+    Printed text is typically gray ~115; hand-drawn pen/star ink is ~157.
+    Suppressing pixels above 140 removes light pen marks while keeping dark
+    printed characters intact, producing a cleaner image for projection and OCR.
+    """
+    out = gray.copy()
+    out[out > threshold] = 255
+    return out
+
+
 def _find_clue_starts_by_projection(col_img: np.ndarray) -> list[int]:
     """
     Return a sorted list of y-centre positions where new numbered clue lines begin.
 
-    Strategy:
-    1. Adaptive-threshold the column to a binary image.
-    2. Use horizontal projection to find all text-line bands.
-    3. For each band, check whether the "number zone" (a narrow x-strip just
-       to the right of the column separator) contains significant ink.
-       - If it does → this line starts with a clue number (new clue).
-       - If it doesn't → this is a continuation of the previous clue.
+    Strategy: scan the ROW PROJECTION of the number zone only (the narrow
+    left strip where clue digits are printed).  Each clue-start line has a
+    digit there; continuation lines have near-zero ink.  This produces a
+    1-D signal with clear peaks at each clue number position regardless of
+    how close together the surrounding text lines are.
 
-    The separator is the thick vertical line at the left edge of the column;
-    it is skipped automatically because we probe x=40–90, i.e. after it.
+    1. Locate the clue body via _find_clue_text_bounds (skip the heading).
+    2. Binarise with adaptive threshold (same params as _scan_column_for_stars).
+    3. Row-project the number zone (text_x to text_x+80) inside the body.
+    4. Smooth, then find local peaks above a noise threshold.
+    5. Return the y-centres of those peaks.
+    """
+    ch, cw = col_img.shape[:2]
+
+    # Step 1: body bounds — skip the ACROSS/DOWN heading
+    y_first, y_last = _find_clue_text_bounds(col_img)
+    if y_last <= y_first or y_last - y_first < 20:
+        y_first, y_last = 0, ch
+
+    # Step 2: binarize
+    text_x = _find_text_start_x(col_img)
+    nz_x2 = min(cw, text_x + 80)
+    if nz_x2 <= text_x:
+        return []
+
+    gray = cv2.cvtColor(col_img, cv2.COLOR_RGB2GRAY)
+    gray = _suppress_light_ink(gray)  # remove pencil / light star marks from gap rows
+    nz_gray = gray[y_first:y_last, text_x:nz_x2]
+    if nz_gray.size == 0:
+        return []
+    nz_bin = cv2.adaptiveThreshold(
+        nz_gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 31, 10
+    )
+
+    # Step 3: row projection of the number zone
+    nz_w = nz_x2 - text_x
+    row_proj = np.sum(nz_bin > 0, axis=1).astype(float)
+
+    # Step 4: smooth with a window ≈ expected digit height (scale with col height)
+    body_h = y_last - y_first
+    # Typical digit height: body_h / (N * 3) where N≈15 clues, 3 lines each.
+    # Clamp between 8 and 60 px so extreme images stay sensible.
+    smooth_w = int(np.clip(body_h / 45, 8, 60))
+    kernel = np.ones(smooth_w) / smooth_w
+    smoothed = np.convolve(row_proj, kernel, mode="same")
+
+    # Noise floor: at least 10% of the number-zone width must be inked on a
+    # clue-start row (single digit ≈ 20–40% of 80 px wide zone at any scale).
+    noise_floor = max(1.0, nz_w * 0.10)
+
+    # Step 5: find continuous runs above noise_floor in the smoothed signal.
+    # Each run = one clue number (digit appears in number zone for several
+    # consecutive rows, then disappears for the continuation / gap rows).
+    # Use the run centre as the clue-start y-position.
+    runs: list[tuple[int, int]] = []
+    in_run = False
+    run_start = 0
+    for i, val in enumerate(smoothed):
+        if not in_run and val >= noise_floor:
+            in_run = True
+            run_start = i
+        elif in_run and val < noise_floor:
+            in_run = False
+            runs.append((run_start, i))
+    if in_run:
+        runs.append((run_start, len(smoothed)))
+
+    # Convert relative indices back to full column coordinates
+    result = [y_first + (r0 + r1) // 2 for r0, r1 in runs]
+
+    logger.debug(
+        "_find_clue_starts_by_projection: y_first=%d y_last=%d smooth_w=%d "
+        "runs=%d clue_starts=%d",
+        y_first, y_last, smooth_w, len(runs), len(result),
+    )
+    return result
+
+
+def _find_clue_text_bounds(col_img: np.ndarray) -> tuple[int, int]:
+    """
+    Return (y_first_clue, y_last_clue) — the vertical extent of the clue body
+    within `col_img`.
+
+    Strategy: project the full-width binary image onto the y-axis, find all
+    text bands, then identify:
+      • the HEADING band  — the short band just before the main body
+      • the BODY band     — the large continuous band containing all clues
+
+    The heading band bottom + small gap gives y_first.
+    The body band bottom gives y_last.
+
+    Falls back to (0, col_height) if detection fails.
     """
     ch, cw = col_img.shape[:2]
     gray = cv2.cvtColor(col_img, cv2.COLOR_RGB2GRAY)
+    gray = _suppress_light_ink(gray)
+    blurred = cv2.GaussianBlur(gray, (5, 5), 0)
     binary = cv2.adaptiveThreshold(
-        gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 31, 10
+        blurred, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 61, 15
     )
+    text_x = _find_text_start_x(col_img)
+    text_area = binary[:, text_x:]
+    row_proj = np.sum(text_area > 0, axis=1).astype(int)
+    min_ink = max(4, text_area.shape[1] // 150)
 
-    # Horizontal projection: dark pixels per row
-    row_proj = np.sum(binary > 0, axis=1).astype(int)
-    min_ink = max(4, cw // 150)  # ignore near-empty rows
-
-    # Detect text bands
     bands: list[tuple[int, int]] = []
-    in_band = False
-    start = 0
+    in_band, start = False, 0
     for y in range(ch):
         if not in_band and row_proj[y] > min_ink:
-            in_band = True
-            start = y
+            in_band, start = True, y
         elif in_band and row_proj[y] <= 1:
             in_band = False
             if y - start > 4:
@@ -550,7 +645,6 @@ def _find_clue_starts_by_projection(col_img: np.ndarray) -> list[int]:
     if in_band:
         bands.append((start, ch))
 
-    # Merge bands within 8px (handles anti-aliased edges & sparse rows)
     merged: list[list[int]] = []
     for y1, y2 in bands:
         if merged and y1 - merged[-1][1] <= 8:
@@ -558,28 +652,105 @@ def _find_clue_starts_by_projection(col_img: np.ndarray) -> list[int]:
         else:
             merged.append([y1, y2])
 
-    # Number zone: x=40–90 (after the column separator, before the text body).
-    # The separator occupies roughly x=25–38; clue numbers appear at x≈42–85.
-    nz_x1, nz_x2 = 40, 90
-    nz_width = nz_x2 - nz_x1
+    # Largest band (>300px) is the continuous clue body; there may be large
+    # non-text bands (dark objects, photos) so pick by maximum height.
+    body_candidates = [(y1, y2) for y1, y2 in merged if (y2 - y1) > 300]
+    if body_candidates:
+        body_y1, body_y2 = max(body_candidates, key=lambda b: b[1] - b[0])
+    elif merged:
+        # No single large band (e.g. many small clue rows with wide gaps).
+        # Treat the full extent of all text bands as the body.
+        body_y1, body_y2 = merged[0][0], merged[-1][1]
+    else:
+        body_y1, body_y2 = -1, -1
 
-    new_starts: list[int] = []
+    # Heading band: last short band (20–150px) that ends before the body starts.
+    heading_end: int = -1
     for y1, y2 in merged:
         band_h = y2 - y1
-        if band_h < 5:
-            continue
-        # Skip ACROSS/DOWN headings: they have ink spanning most of the column width
-        if np.sum(binary[y1:y2, :] > 0) > band_h * cw * 0.08:
-            continue
-        # Count ink in the number zone
-        nz_ink = int(np.sum(binary[y1:y2, nz_x1:nz_x2] > 0))
-        # A digit of height ~60px and width ~20px ≈ 600 ink pixels; background ≈ 5-15
-        ink_density = nz_ink / max(band_h, 1)
-        if ink_density > 1.5:  # at least 1.5 ink pixels per row in the number zone
-            new_starts.append((y1 + y2) // 2)
+        if 20 <= band_h <= 150 and (body_y1 < 0 or y2 <= body_y1 + 20):
+            heading_end = y2
 
-    logger.debug("_find_clue_starts_by_projection: found %d new-clue lines", len(new_starts))
-    return new_starts
+    if heading_end > 0:
+        y_first = heading_end + 10
+    elif body_y1 > 0:
+        y_first = body_y1
+    else:
+        y_first = max(0, ch // 10)
+
+    y_last = body_y2 if body_y2 > 0 else int(ch * 0.92)
+
+    logger.debug(
+        "_find_clue_text_bounds: heading_end=%d body=[%d,%d] → y_first=%d y_last=%d",
+        heading_end, body_y1, body_y2, y_first, y_last,
+    )
+    return y_first, y_last
+
+
+def _align_projection_to_sequence(
+    proj_ys: list[int],
+    clue_sequence: list[int],
+    col_height: int,
+) -> list[tuple[int, int]]:
+    """
+    Map M detected y-positions (from row-projection) to N clue numbers in
+    sequence order.
+
+    - M == N: direct 1-to-1 assignment.
+    - M > N: sub-sample evenly (false positives are scattered; real clue
+             starts are roughly evenly spaced).
+    - M < N: treat proj_ys as anchors spread uniformly over the sequence,
+             then interpolate/extrapolate the remaining entries exactly as
+             the OCR path does.
+    """
+    N = len(clue_sequence)
+    M = len(proj_ys)
+    if M == 0 or N == 0:
+        return []
+
+    proj_ys = sorted(proj_ys)
+
+    if M >= N:
+        if M == N:
+            selected = proj_ys
+        else:
+            # Pick N evenly spaced samples from the M detections.
+            indices = [int(round(i * (M - 1) / (N - 1))) for i in range(N)]
+            selected = [proj_ys[idx] for idx in indices]
+        return list(zip(selected, clue_sequence))
+
+    # M < N — distribute M detections evenly over the N-entry sequence as anchors.
+    step = (N - 1) / (M - 1) if M > 1 else 0.0
+    anchors: list[tuple[int, int, int]] = []  # (seq_idx, y, clue_num)
+    for i, y in enumerate(proj_ys):
+        idx = min(N - 1, int(round(i * step))) if M > 1 else 0
+        anchors.append((idx, y, clue_sequence[idx]))
+
+    m_idxs = [a[0] for a in anchors]
+    m_ys   = [a[1] for a in anchors]
+    avg_spacing = (m_ys[-1] - m_ys[0]) / max(len(m_ys) - 1, 1) if len(m_ys) >= 2 else col_height / max(N, 1)
+
+    result: list[tuple[int, int]] = [(y, num) for _, y, num in anchors]
+    anchored = set(m_idxs)
+    for i in range(N):
+        if i in anchored:
+            continue
+        before = [(j, y) for j, y in zip(m_idxs, m_ys) if j < i]
+        after  = [(j, y) for j, y in zip(m_idxs, m_ys) if j > i]
+        if before and after:
+            j, y_j = max(before, key=lambda t: t[0])
+            k, y_k = min(after,  key=lambda t: t[0])
+            y_interp = int(y_j + (i - j) / (k - j) * (y_k - y_j))
+        elif after:
+            k, y_k = min(after, key=lambda t: t[0])
+            y_interp = int(y_k - (k - i) * avg_spacing)
+        else:
+            j, y_j = max(before, key=lambda t: t[0])
+            y_interp = int(y_j + (i - j) * avg_spacing)
+        result.append((max(0, y_interp), clue_sequence[i]))
+
+    result.sort(key=lambda t: t[0])
+    return result
 
 
 def _build_clue_map_from_sequence(
@@ -587,73 +758,136 @@ def _build_clue_map_from_sequence(
     clue_sequence: list[int],
 ) -> list[tuple[int, int]]:
     """
-    Build a (y_centre, clue_number) map by:
-    1. Using horizontal projection to find new-clue-start y-positions.
-    2. Aligning them (in order) with the known clue number sequence from the DB.
+    Build a (y_centre, clue_number) map for the clues in `clue_sequence`.
 
-    If the detected count doesn't match the sequence length we log a warning
-    and fall back to evenly-spaced interpolation between the matched points.
+    Strategy (in priority order):
+      1. Row-projection (primary): detect actual clue-start y-positions from
+         ink density. Works when M detected positions ≥ N/2 expected clues.
+         OCR exact positions override projection where available.
+      2. OCR-only with interpolation: when projection is sparse (M < N/2),
+         fall back to the original OCR value-matching + linear interpolation.
+      3. Uniform spacing: last resort when both projection and OCR fail.
     """
-    starts = _find_clue_starts_by_projection(col_img)
-    n_detected = len(starts)
-    n_expected = len(clue_sequence)
-
-    if n_detected == 0:
-        logger.warning("_build_clue_map_from_sequence: no clue starts detected")
+    if not clue_sequence:
         return []
 
-    if n_expected == 0:
-        return []
+    N = len(clue_sequence)
 
-    if n_detected == n_expected:
-        result = list(zip(starts, clue_sequence))
-        logger.debug("_build_clue_map_from_sequence: perfect match %d clues", n_expected)
+    # --- OCR anchors (exact clue-number → y mappings) ---
+    ocr_map = _build_clue_number_map(col_img)
+    seq_set = set(clue_sequence)
+    ocr_by_num: dict[int, int] = {}
+    for y, num in sorted(ocr_map, key=lambda t: t[0]):
+        if num in seq_set and num not in ocr_by_num:
+            ocr_by_num[num] = y
+
+    matched: list[tuple[int, int, int]] = []   # (seq_idx, y, clue_num)
+    missing_idxs: list[int] = []
+    for i, num in enumerate(clue_sequence):
+        if num in ocr_by_num:
+            matched.append((i, ocr_by_num[num], num))
+        else:
+            missing_idxs.append(i)
+
+    # --- Primary: row-projection clue starts (when OCR coverage is sparse) ---
+    # OCR-primary takes over when it covers ≥ 1/3 of the sequence (dense
+    # enough that linear interpolation between close anchors is accurate).
+    # When OCR covers < 1/3, projection-detected positions are more reliable
+    # than linear extrapolation from just a handful of anchors.
+    ocr_is_dense = len(matched) * 3 >= N
+
+    if not ocr_is_dense:
+        proj_ys = _find_clue_starts_by_projection(col_img)
+        proj_ratio = len(proj_ys) / N if N else 0.0
+
+        if proj_ys and 0.4 <= proj_ratio <= 2.5:
+            base = _align_projection_to_sequence(proj_ys, clue_sequence, col_img.shape[0])
+            # Override with exact OCR positions where available.
+            if ocr_by_num:
+                base_dict = {num: y for y, num in base}   # num → y
+                base_dict.update(ocr_by_num)               # OCR wins on conflict
+                result = sorted(
+                    ((y, num) for num, y in base_dict.items()), key=lambda t: t[0]
+                )
+            else:
+                result = base
+            logger.debug(
+                "_build_clue_map_from_sequence (projection+OCR): M=%d N=%d ocr=%d",
+                len(proj_ys), N, len(matched),
+            )
+            return result
+
+    # --- OCR-primary with interpolation ---
+    logger.debug(
+        "_build_clue_map_from_sequence: OCR-primary (%d/%d anchors, dense=%s)",
+        len(matched), N, ocr_is_dense,
+    )
+
+    if len(matched) >= 1:
+        result = [(y, num) for _, y, num in matched]
+        m_idxs = [m[0] for m in matched]
+        m_ys   = [m[1] for m in matched]
+        if len(m_ys) >= 2:
+            avg_spacing = (m_ys[-1] - m_ys[0]) / (len(m_ys) - 1)
+        else:
+            avg_spacing = col_img.shape[0] / max(N, 1)
+
+        for i in missing_idxs:
+            before = [(j, y) for j, y in zip(m_idxs, m_ys) if j < i]
+            after  = [(j, y) for j, y in zip(m_idxs, m_ys) if j > i]
+            if before and after:
+                j, y_j = max(before, key=lambda t: t[0])
+                k, y_k = min(after,  key=lambda t: t[0])
+                y_interp = int(y_j + (i - j) / (k - j) * (y_k - y_j))
+            elif after:
+                k, y_k = min(after, key=lambda t: t[0])
+                y_interp = int(y_k - (k - i) * avg_spacing)
+            else:
+                j, y_j = max(before, key=lambda t: t[0])
+                y_interp = int(y_j + (i - j) * avg_spacing)
+            result.append((max(0, y_interp), clue_sequence[i]))
+
+        result.sort(key=lambda t: t[0])
+        logger.debug("_build_clue_map_from_sequence (OCR-interp): %d entries", len(result))
         return result
 
-    # More detections than expected: take the n_expected best-spaced subset
-    if n_detected > n_expected:
-        logger.debug(
-            "_build_clue_map_from_sequence: %d detected > %d expected, trimming",
-            n_detected, n_expected,
-        )
-        # Keep every k-th detection
-        step = n_detected / n_expected
-        selected = [starts[min(int(i * step), n_detected - 1)] for i in range(n_expected)]
-        return list(zip(selected, clue_sequence))
-
-    # Fewer detections than expected: interpolate gaps
-    logger.debug(
-        "_build_clue_map_from_sequence: %d detected < %d expected, interpolating",
-        n_detected, n_expected,
+    # --- Uniform spacing last resort ---
+    logger.warning(
+        "_build_clue_map_from_sequence: OCR gave 0 anchors and projection "
+        "either skipped or sparse — falling back to uniform spacing",
     )
-    result: list[tuple[int, int]] = []
-    for i, (y, num) in enumerate(zip(starts, clue_sequence)):
-        result.append((y, num))
-    # Extrapolate missing tail entries using average spacing
-    if len(starts) >= 2:
-        avg_spacing = (starts[-1] - starts[0]) / max(len(starts) - 1, 1)
-        for i in range(n_detected, n_expected):
-            y_extrap = int(starts[-1] + (i - n_detected + 1) * avg_spacing)
-            result.append((y_extrap, clue_sequence[i]))
+    y_first, y_last = _find_clue_text_bounds(col_img)
+    if N == 1:
+        result = [(y_first, clue_sequence[0])]
+    else:
+        spacing = (y_last - y_first) / (N - 1)
+        result = [
+            (int(y_first + i * spacing), num)
+            for i, num in enumerate(clue_sequence)
+        ]
+    logger.debug(
+        "_build_clue_map_from_sequence (uniform): y_first=%d y_last=%d spacing=%.1f N=%d",
+        y_first, y_last, (y_last - y_first) / max(N - 1, 1), N,
+    )
     return result
 
 
 def _build_clue_number_map(
     col_img: np.ndarray,
-    scale: float = 2.0,
+    scale: float = 3.0,
+    num_zone_width: int = 80,
 ) -> list[tuple[int, int]]:
     """
-    OCR the full column image and return a sorted list of
+    OCR the number zone of a clue column and return a sorted list of
     (y_center_in_original_coords, clue_number) pairs.
 
-    OCR-ing the full column (rather than a narrow num_zone crop) gives Tesseract
-    complete word context so it doesn't produce garbage from truncated characters.
-    We then filter the resulting tokens by x position to keep only those that
-    appear at the left edge — which is where clue numbers are printed.
-
-    By OCR-ing the whole column at once we also avoid the problem of a hand-drawn
-    star covering the printed digit: stars appear on ~6 clues, so the other 25+
-    entries give a reliable y→number map we look up from.
+    Clue numbers are printed bold at the very left edge of each column,
+    aligned with the ACROSS/DOWN heading.  Rather than OCR-ing the entire
+    column (where body text confuses Tesseract), we crop to the narrow
+    number zone (text_start_x .. text_start_x + num_zone_width) and use
+    sparse-text mode so isolated digit groups are recognised reliably.
+    Stars appear on only ~6 of ~30 clues, so the remaining entries provide
+    a solid y → clue_number map even when some digits are obscured.
     """
     try:
         import pytesseract
@@ -664,23 +898,26 @@ def _build_clue_number_map(
         return []
 
     ch, cw = col_img.shape[:2]
-    gray = cv2.cvtColor(col_img, cv2.COLOR_RGB2GRAY)
+    text_start = _find_text_start_x(col_img)
+    nz_end = min(cw, text_start + num_zone_width)
+    num_zone = col_img[:, text_start:nz_end]
+
+    gray = cv2.cvtColor(num_zone, cv2.COLOR_RGB2GRAY)
+    # Do NOT suppress light ink here — anti-aliased edges of bold digit strokes
+    # sit in the 118–140 gray range and suppressing them degrades OCR quality.
+    # Star pen ink (~157 gray) won't produce valid digit tokens anyway.
     upscaled = cv2.resize(gray, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
     _, thresh = cv2.threshold(upscaled, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
 
     try:
         data = pytesseract.image_to_data(
             thresh,
-            config="--psm 6",
+            config="--psm 11",   # sparse text — best for isolated numbers
             output_type=pytesseract.Output.DICT,
         )
     except Exception as exc:
         logger.debug("_build_clue_number_map: OCR failed: %s", exc)
         return []
-
-    # Clue numbers appear at the left edge of the column.
-    # Allow up to 12% of the column width from the left edge.
-    x_cutoff = cw * scale * 0.12
 
     result: list[tuple[int, int]] = []
     seen_y: set[int] = set()
@@ -691,9 +928,6 @@ def _build_clue_number_map(
             continue
         conf = int(data["conf"][i])
         if conf < 30:
-            continue
-        bx = data["left"][i]
-        if bx > x_cutoff:
             continue
         bh = data["height"][i]
         by = data["top"][i]
@@ -733,6 +967,36 @@ def _lookup_clue_number(
                      best_y, max_dist, star_y)
         return None
     return best_num
+
+
+def _classify_contour_shape(contour: np.ndarray) -> str:
+    """
+    First-stage shape classifier: distinguishes elongated line-like strokes from
+    compact blobs before the more expensive radial-peaks star test is applied.
+
+    Returns:
+        'line' — elongated mark (underline, tick, strikethrough, diagonal stroke)
+        'blob' — compact shape; pass to second-stage star classifier
+
+    Uses the minimum-area enclosing rectangle so diagonal lines are caught as
+    reliably as axis-aligned ones.  Contours with too few points to compute a
+    reliable rectangle are passed through as 'blob' so the radial-peaks test
+    gets a chance to evaluate them rather than silently discarding them.
+    """
+    if len(contour) < 5:
+        return "blob"
+
+    _, (rw, rh), _ = cv2.minAreaRect(contour)
+    long_side = max(rw, rh)
+    short_side = min(rw, rh)
+
+    if short_side < 1:
+        return "blob"  # degenerate — can't determine shape; let stage 2 decide
+
+    if long_side / short_side > 3.0:
+        return "line"
+
+    return "blob"
 
 
 def classify_annotation(cell: np.ndarray) -> tuple[Optional[str], float]:
@@ -790,18 +1054,41 @@ def classify_annotation(cell: np.ndarray) -> tuple[Optional[str], float]:
 
     smooth = np.convolve(bins, np.ones(3) / 3, mode="same")
     mean_r = smooth.mean()
-    peaks = 0
+    peak_bins: list[int] = []
     for i in range(n_bins):
         v = smooth[i]
         if v > smooth[(i - 1) % n_bins] and v > smooth[(i + 1) % n_bins] and v > mean_r * 1.15:
-            peaks += 1
+            peak_bins.append(i)
 
-    if 4 <= peaks <= 7:
-        confidence = min(0.95, 0.65 + (peaks - 4) * 0.05)
-        logger.debug("Star: peaks=%d density=%.2f conf=%.2f", peaks, density, confidence)
-        return "star", confidence
+    n_peaks = len(peak_bins)
+    if not (4 <= n_peaks <= 7):
+        return None, 0.85
 
-    return None, 0.85
+    # Spacing-uniformity check: a real star has evenly-spaced radial peaks
+    # (e.g. 5-pointed ★ → peaks ~72° = ~14 bins apart). Bold digit pairs
+    # also produce 4-7 peaks but at irregular angular intervals.
+    # Reject if the coefficient of variation of inter-peak gaps exceeds 0.45.
+    sorted_bins = sorted(peak_bins)
+    gaps = [
+        (sorted_bins[(k + 1) % n_peaks] - sorted_bins[k]) % n_bins
+        for k in range(n_peaks)
+    ]
+    gap_mean = sum(gaps) / n_peaks
+    gap_std = (sum((g - gap_mean) ** 2 for g in gaps) / n_peaks) ** 0.5
+    spacing_cv = gap_std / gap_mean if gap_mean > 0 else 1.0
+    if spacing_cv > 0.80:
+        logger.debug(
+            "Rejected irregular peaks=%d spacing_cv=%.2f gaps=%s",
+            n_peaks, spacing_cv, gaps,
+        )
+        return None, 0.85
+
+    confidence = min(0.95, 0.65 + (n_peaks - 4) * 0.05)
+    logger.debug(
+        "Star: peaks=%d spacing_cv=%.2f density=%.2f conf=%.2f",
+        n_peaks, spacing_cv, density, confidence,
+    )
+    return "star", confidence
 
 
 def _normalize_clue_orientation(
@@ -840,6 +1127,41 @@ def _normalize_clue_orientation(
             if rot_code is not None:
                 logger.info("Clue region rotated to correct orientation (code=%s)", rot_code)
             return candidate, rot_code
+
+    # OCR-based detection failed; fall back to row-projection-variance heuristic.
+    # Horizontal text produces alternating dense/sparse rows (high variance).
+    # Rotated text produces uniform row density (low variance).
+    # We pick the rotation whose text area has the highest row projection std.
+    best_code, best_score = None, -1.0
+    for rot_code, candidate in candidates:
+        h, w = candidate.shape[:2]
+        # Find text start to skip dark margins before sampling
+        ts = _find_text_start_x(candidate)
+        text_area = candidate[:min(h, 2000), ts:ts + 800]
+        if text_area.shape[1] < 100:
+            continue
+        gray = cv2.cvtColor(text_area, cv2.COLOR_RGB2GRAY)
+        blurred = cv2.GaussianBlur(gray, (3, 3), 0)
+        binary = cv2.adaptiveThreshold(
+            blurred, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 61, 15
+        )
+        row_proj = np.sum(binary > 0, axis=1).astype(float) / text_area.shape[1]
+        score = float(np.std(row_proj))
+        logger.debug(
+            "_normalize_clue_orientation: rot=%s row_std=%.4f",
+            rot_code, score,
+        )
+        if score > best_score:
+            best_score = score
+            best_code = rot_code
+
+    if best_code is not None and best_score > 0.05:
+        candidate = region if best_code is None else cv2.rotate(region, best_code)
+        logger.info(
+            "Clue region rotated by row-variance heuristic (code=%s score=%.4f)",
+            best_code, best_score,
+        )
+        return candidate, best_code
 
     logger.debug("_normalize_clue_orientation: no rotation matched, using original")
     return region, None
@@ -883,12 +1205,24 @@ def _col_ink_density(col_img: np.ndarray) -> np.ndarray:
 def _find_text_start_x(col_img: np.ndarray) -> int:
     """
     Return the first x-column from the LEFT that contains actual printed text
-    (ink density 1–35%), skipping any solid-dark margin.
+    (ink density 1–35%), skipping any solid-dark margin or internal separator.
+
+    Clue columns sometimes have a vertical rule AFTER the number zone (not at
+    x=0), so we first scan the first 200px for any separator spike (density
+    > 50%) and start the text search from just past it.  If no separator is
+    found the original two-phase logic applies.
     """
     col_proj = _col_ink_density(col_img)
     cw = len(col_proj)
-    # Phase 1: skip solid-dark left margin (density > 25%)
-    i = 0
+
+    # Find the rightmost separator spike (density > 0.5) within the first 200px.
+    last_sep = -1
+    for k in range(min(cw, 200)):
+        if col_proj[k] > 0.50:
+            last_sep = k
+    i = last_sep + 1 if last_sep >= 0 else 0
+
+    # Phase 1: skip any remaining solid-dark region (density > 25%)
     while i < cw and col_proj[i] > 0.25:
         i += 1
     # Phase 2: find first column with text-like density (1–35%)
@@ -920,7 +1254,7 @@ def _scan_column_for_stars(
     direction: str,
     num_zone_px: int = 250,
     scan_from_right: bool = False,
-    min_star_area: int = 1200,
+    min_star_area: int = 2000,
     max_star_area: int = 25000,
     min_star_dim: int = 40,
     clue_map: Optional[list[tuple[int, int]]] = None,
@@ -983,16 +1317,18 @@ def _scan_column_for_stars(
         if area < min_star_area or area > max_star_area:
             continue
 
+        # Stage 1: reject line-like strokes (underlines, ticks, strikethroughs).
+        if _classify_contour_shape(c) == "line":
+            logger.debug("Skipping line-shaped contour (area=%.0f)", area)
+            continue
+
         x, y, w, h = cv2.boundingRect(c)
         nz_w = num_zone.shape[1]
-        # Stars are roughly square and have minimum real size
         if w == 0 or h == 0:
-            continue
-        if w / h > 3.5 or h / w > 3.5:
             continue
         if w < min_star_dim or h < min_star_dim:
             continue
-        # Reject blobs that span almost the full zone width (text lines, not stars)
+        # Reject blobs that span almost the full zone width (wide text smears, not stars)
         if w > nz_w * 0.75:
             continue
 
@@ -1011,7 +1347,6 @@ def _scan_column_for_stars(
         seen_y.append(y)
 
         # Look up the clue number from the pre-built column map.
-        # The star centre is at y + h/2 within the num_zone.
         star_y_center = y + h // 2
         clue_num = _lookup_clue_number(clue_map, star_y_center)
 

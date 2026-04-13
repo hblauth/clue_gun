@@ -48,9 +48,9 @@ crossword_blog/
 ## TODO
 
 ### Times Scraper
-- [ ] Parse crossword HTML into Go structs (clues + answers) ← in progress
-- [ ] Save parsed crosswords as local JSON files
-- [ ] Write unit tests for HTML parser
+- [x] Parse crossword HTML into Go structs (clues + answers)
+- [x] Save parsed crosswords as local JSON files (1,400+ puzzles scraped)
+- [x] Write unit tests for HTML parser
 
 ### PostgreSQL Integration
 - [ ] Create `crosswords_raw` table (DDL)
@@ -59,7 +59,7 @@ crossword_blog/
 - [ ] Verify inserted data matches schema
 
 ### Clue Indexer
-- [ ] Extract unique words from clues and answers (MVP)
+- [x] Extract unique words from clues and answers (MVP)
 - [ ] Count word frequencies
 - [ ] Store word stats in `dictionary_stats` table
 - [ ] Write tests for frequency counter
@@ -68,18 +68,25 @@ crossword_blog/
 - [ ] Add phrases (multi-word answers and clue fragments)
 
 ### Image Processor
-- [ ] Load and display crossword photo with OpenCV
-- [ ] Detect highlighted squares
-- [ ] Map highlights to clue numbers
-- [ ] OCR clue text from image regions
-- [ ] Save OCR results as JSON
-- [ ] Write tests for OCR output
+- [x] Load crossword photo with OpenCV (HEIC + JPG)
+- [x] Normalise clue-list orientation (90° rotation detection)
+- [x] Split normalised region into ACROSS / DOWN columns
+- [x] Detect ACROSS / DOWN column headings via OCR
+- [x] Build clue-number map from puzzle JSON sequence (OCR + row-projection fallback)
+- [x] Scan num-zone for star-shaped contours (radial-peaks classifier)
+- [x] `validate.py` harness against 83-image ground-truth dataset (F1 = 0.126)
+- [x] 52 unit tests across pipeline helpers
+- [ ] **Phase 2** — per-clue classification: for each clue in the map, crop the annotation zone and classify as star / no-star (cuts FP rate from digit-pair false positives)
+- [ ] **Phase 3** — fix DOWN column `_find_text_start_x` returning 0 for JPG images (scans crossword grid instead of clue text)
+- [ ] Integrate star detections with PostgreSQL
+- [ ] Handle edge cases: multi-page clue lists, very dark photos, no annotation
 
 ### Social Bot
-- [ ] Generate templated captions from clues
-- [ ] Select visual asset per clue
-- [ ] Render short video clip (text + asset → MP4)
-- [ ] Queue video + metadata for posting
+- [x] Generate image cards (clue + metadata rendered to PNG)
+- [x] Post to Instagram via Playwright browser automation
+- [x] Queue posts via Redis scheduler
+- [ ] Post to TikTok
+- [ ] Post to X (Twitter)
 - [ ] Log post metadata to PostgreSQL
 
 ### Frontend
@@ -95,6 +102,8 @@ crossword_blog/
 - [ ] Look at old Times for the Times website for more puzzles
 - [ ] Scrape the Times Crossword Club website for clues and perhaps answers
 - [ ] Move to cloud app
+- [ ] Add times snitch lookup
+- [ ] Add companion - done / not done / time completed etc. integrate with times crossword club?
 
 ## Contributing
 
