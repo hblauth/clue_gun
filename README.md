@@ -74,10 +74,11 @@ crossword_blog/
 - [x] Detect ACROSS / DOWN column headings via OCR
 - [x] Build clue-number map from puzzle JSON sequence (OCR + row-projection fallback)
 - [x] Scan num-zone for star-shaped contours (radial-peaks classifier)
-- [x] `validate.py` harness against 83-image ground-truth dataset (F1 = 0.126)
-- [x] 52 unit tests across pipeline helpers
-- [ ] **Phase 2** — per-clue classification: for each clue in the map, crop the annotation zone and classify as star / no-star (cuts FP rate from digit-pair false positives)
-- [ ] **Phase 3** — fix DOWN column `_find_text_start_x` returning 0 for JPG images (scans crossword grid instead of clue text)
+- [x] `validate.py` harness against 150-image ground-truth dataset (68 HEIC + 82 JPG, F1 = 0.127)
+- [x] 53 unit tests across pipeline helpers
+- [x] **Phase 2** — spacing-uniformity check in `classify_annotation` (inter-peak CV > 0.80) to filter digit-pair FPs; geometric classifier ceiling reached at F1≈0.128
+- [x] **Phase 3** — fix `find_clue_list_region` skipping dense candidates (adjacent newspaper pages) to correctly identify clue list for JPG images; expanded dataset to 150 images via HEIC→JPG conversion
+- [ ] **Phase 4** — learned classifier (CNN on labeled crops) to break through geometric classifier ceiling; ground truth in `data/labels/stars.csv`
 - [ ] Integrate star detections with PostgreSQL
 - [ ] Handle edge cases: multi-page clue lists, very dark photos, no annotation
 
