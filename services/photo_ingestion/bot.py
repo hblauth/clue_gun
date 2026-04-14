@@ -32,10 +32,18 @@ logger = logging.getLogger(__name__)
 PHOTOS_DIR = Path.home() / "Desktop" / "crossword_photos" / "Times"
 
 
+SEND_AS_FILE_TIP = (
+    "📎 For best results, send photos using 'Send as File' (hold the attach "
+    "button → File) so the full resolution is preserved. Regular photo sends "
+    "are compressed to 1280px and may not process correctly."
+)
+
+
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
-        "👋 Send me a photo of your crossword and I'll save it to the collection.\n"
-        "Use /list to see recently saved photos."
+        "👋 Send me a crossword photo and I'll save it to the collection.\n\n"
+        + SEND_AS_FILE_TIP
+        + "\n\nUse /list to see recently saved photos."
     )
 
 
@@ -62,7 +70,11 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     await file.download_to_drive(dest)
     logger.info("Saved photo: %s (%.1f KB)", dest, dest.stat().st_size / 1024)
 
-    await update.message.reply_text(f"✅ Saved as {filename}")
+    await update.message.reply_text(
+        f"✅ Saved as {filename}\n\n"
+        "⚠️ This was compressed to 1280px by Telegram and may not process well. "
+        + SEND_AS_FILE_TIP
+    )
 
 
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
